@@ -1,0 +1,222 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Android 11+ 包可见性：不声明就枚举不到 Multi TTS 等第三方语音引擎。 -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".MoReadApplication"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:localeConfig="@xml/locales_config"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.MoRead"
+        android:usesCleartextTraffic="true"
+        tools:targetApi="33">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- 让系统文件管理器的“其他应用打开”列出墨知。 -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:mimeType="application/epub+zip" />
+                <data android:mimeType="application/octet-stream" />
+                <data android:mimeType="application/x-mdx" />
+                <data android:mimeType="application/x-mdict" />
+                <data android:mimeType="application/x-mdict-mdx" />
+                <data android:mimeType="application/mdx" />
+                <data android:mimeType="application/mdict" />
+                <data android:mimeType="text/plain" />
+                <data android:mimeType="font/ttf" />
+                <data android:mimeType="font/otf" />
+                <data android:mimeType="font/collection" />
+                <data android:mimeType="font/sfnt" />
+                <data android:mimeType="application/font-sfnt" />
+                <data android:mimeType="application/x-font-ttf" />
+                <data android:mimeType="application/x-font-truetype" />
+                <data android:mimeType="application/vnd.ms-opentype" />
+                <data android:mimeType="application/x-font-opentype" />
+            </intent-filter>
+            <!-- MDX has no universal MIME type. Filename filters cover local URIs with absent or arbitrary types. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:host="*" />
+                <data android:pathPattern=".*\\.mdx" />
+                <data android:pathPattern=".*\\.mdX" />
+                <data android:pathPattern=".*\\.mDx" />
+                <data android:pathPattern=".*\\.mDX" />
+                <data android:pathPattern=".*\\.Mdx" />
+                <data android:pathPattern=".*\\.MdX" />
+                <data android:pathPattern=".*\\.MDx" />
+                <data android:pathPattern=".*\\.MDX" />
+                <!-- Android 12+ suffix matching also handles dots in directories and filenames. -->
+                <data android:pathSuffix=".mdx" />
+                <data android:pathSuffix=".mdX" />
+                <data android:pathSuffix=".mDx" />
+                <data android:pathSuffix=".mDX" />
+                <data android:pathSuffix=".Mdx" />
+                <data android:pathSuffix=".MdX" />
+                <data android:pathSuffix=".MDx" />
+                <data android:pathSuffix=".MDX" />
+                <!-- Legacy simple-glob matching does not backtrack; cover common dotted names. -->
+                <data android:pathPattern=".*\\..*\\.mdx" />
+                <data android:pathPattern=".*\\..*\\.mdX" />
+                <data android:pathPattern=".*\\..*\\.mDx" />
+                <data android:pathPattern=".*\\..*\\.mDX" />
+                <data android:pathPattern=".*\\..*\\.Mdx" />
+                <data android:pathPattern=".*\\..*\\.MdX" />
+                <data android:pathPattern=".*\\..*\\.MDx" />
+                <data android:pathPattern=".*\\..*\\.MDX" />
+                <data android:pathPattern=".*\\..*\\..*\\.mdx" />
+                <data android:pathPattern=".*\\..*\\..*\\.mdX" />
+                <data android:pathPattern=".*\\..*\\..*\\.mDx" />
+                <data android:pathPattern=".*\\..*\\..*\\.mDX" />
+                <data android:pathPattern=".*\\..*\\..*\\.Mdx" />
+                <data android:pathPattern=".*\\..*\\..*\\.MdX" />
+                <data android:pathPattern=".*\\..*\\..*\\.MDx" />
+                <data android:pathPattern=".*\\..*\\..*\\.MDX" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.mdx" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.mdX" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.mDx" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.mDX" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.Mdx" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.MdX" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.MDx" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.MDX" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:host="*" />
+                <data android:mimeType="*/*" />
+                <data android:pathPattern=".*\\.mdx" />
+                <data android:pathPattern=".*\\.mdX" />
+                <data android:pathPattern=".*\\.mDx" />
+                <data android:pathPattern=".*\\.mDX" />
+                <data android:pathPattern=".*\\.Mdx" />
+                <data android:pathPattern=".*\\.MdX" />
+                <data android:pathPattern=".*\\.MDx" />
+                <data android:pathPattern=".*\\.MDX" />
+                <!-- Android 12+ suffix matching also handles dots in directories and filenames. -->
+                <data android:pathSuffix=".mdx" />
+                <data android:pathSuffix=".mdX" />
+                <data android:pathSuffix=".mDx" />
+                <data android:pathSuffix=".mDX" />
+                <data android:pathSuffix=".Mdx" />
+                <data android:pathSuffix=".MdX" />
+                <data android:pathSuffix=".MDx" />
+                <data android:pathSuffix=".MDX" />
+                <!-- Legacy simple-glob matching does not backtrack; cover common dotted names. -->
+                <data android:pathPattern=".*\\..*\\.mdx" />
+                <data android:pathPattern=".*\\..*\\.mdX" />
+                <data android:pathPattern=".*\\..*\\.mDx" />
+                <data android:pathPattern=".*\\..*\\.mDX" />
+                <data android:pathPattern=".*\\..*\\.Mdx" />
+                <data android:pathPattern=".*\\..*\\.MdX" />
+                <data android:pathPattern=".*\\..*\\.MDx" />
+                <data android:pathPattern=".*\\..*\\.MDX" />
+                <data android:pathPattern=".*\\..*\\..*\\.mdx" />
+                <data android:pathPattern=".*\\..*\\..*\\.mdX" />
+                <data android:pathPattern=".*\\..*\\..*\\.mDx" />
+                <data android:pathPattern=".*\\..*\\..*\\.mDX" />
+                <data android:pathPattern=".*\\..*\\..*\\.Mdx" />
+                <data android:pathPattern=".*\\..*\\..*\\.MdX" />
+                <data android:pathPattern=".*\\..*\\..*\\.MDx" />
+                <data android:pathPattern=".*\\..*\\..*\\.MDX" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.mdx" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.mdX" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.mDx" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.mDX" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.Mdx" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.MdX" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.MDx" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.MDX" />
+            </intent-filter>
+            <!-- 让文件管理器的“分享文件”目标列表显示墨知。 -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/epub+zip" />
+                <data android:mimeType="application/octet-stream" />
+                <data android:mimeType="application/x-mdx" />
+                <data android:mimeType="application/x-mdict" />
+                <data android:mimeType="application/x-mdict-mdx" />
+                <data android:mimeType="application/mdx" />
+                <data android:mimeType="application/mdict" />
+                <data android:mimeType="text/plain" />
+                <data android:mimeType="font/ttf" />
+                <data android:mimeType="font/otf" />
+                <data android:mimeType="font/collection" />
+                <data android:mimeType="font/sfnt" />
+                <data android:mimeType="application/font-sfnt" />
+                <data android:mimeType="application/x-font-ttf" />
+                <data android:mimeType="application/x-font-truetype" />
+                <data android:mimeType="application/vnd.ms-opentype" />
+                <data android:mimeType="application/x-font-opentype" />
+            </intent-filter>
+        </activity>
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync"
+            tools:node="merge" />
+        <!-- 连续听书：熄屏/后台仍持续朗读，通知栏提供播放控制。 -->
+        <service
+            android:name=".ai.listen.ListenService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback"
+            android:stopWithTask="false" />
+        <!-- 媒体按键兜底路径：会话不是当前 media button session 时，系统改走这条广播。 -->
+        <receiver
+            android:name=".ai.listen.ListenMediaButtonReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON" />
+            </intent-filter>
+        </receiver>
+        <!-- 局域网传书：切到别的应用或熄屏时也别把正在传的书掐断。 -->
+        <service
+            android:name=".core.importer.lan.LanTransferService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+        <!-- 笔记导出分享用：cache/export 下的 Markdown 经内容 URI 交给其他应用。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_provider_paths" />
+        </provider>
+    </application>
+
+</manifest>

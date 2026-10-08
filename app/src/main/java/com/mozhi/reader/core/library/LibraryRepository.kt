@@ -1,0 +1,673 @@
+package com.mozhi.reader.core.library
+
+import android.content.Context
+import androidx.room.withTransaction
+import com.mozhi.reader.core.database.MoReadDatabase
+import com.mozhi.reader.core.database.dao.BookDao
+import com.mozhi.reader.core.database.entity.BookEntity
+import com.mozhi.reader.core.database.entity.BookReadState
+import com.mozhi.reader.core.database.entity.BookSourceType
+import com.mozhi.reader.core.database.entity.BookmarkEntity
+import com.mozhi.reader.core.database.entity.BookTocEntryEntity
+import com.mozhi.reader.core.database.entity.ChapterEntity
+import com.mozhi.reader.core.database.entity.ReadingDailyEntity
+import com.mozhi.reader.core.datastore.ReaderTextReplacementRule
+import com.mozhi.reader.core.datastore.compileRegex
+import com.mozhi.reader.core.datastore.validationError
+import com.mozhi.reader.core.vector.VectorQueries
+import dagger.hilt.android.qualifiers.ApplicationContext
+import io.objectbox.BoxStore
+import java.io.File
+import java.time.ZoneId
+import javax.inject.Inject
+import javax.inject.Singleton
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+data class ChapterDraft(
+    val index: Int,
+    val title: String,
+    val href: String,
+    val charCount: Int
+)
+
+data class BookTocEntryDraft(
+    val orderIndex: Int,
+    val title: String,
+    val href: String,
+    val depth: Int,
+    val parentOrderIndex: Int?,
+    val chapterIndex: Int?,
+    val hasChildren: Boolean
+)
+
+/** A complete chapter replacement used by reader-side editing and chapter re-recognition. */
+data class EditableChapterDraft(
+    val index: Int,
+    val title: String,
+    val href: String,
+    val body: String
+)
+
+@Singleton
+class LibraryRepository @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val database: MoReadDatabase,
+    private val bookDao: BookDao,
+    private val textStore: BookTextStore,
+    private val textWriter: BookTextWriter,
+    private val mediaStore: BookMediaStore,
+    private val layoutStore: BookLayoutStore,
+    private val vectorStore: dagger.Lazy<BoxStore>,
+    private val imageReferenceCleanup: dagger.Lazy<ImageReferenceCleanup>
+) {
+    fun observeBooks(): Flow<List<BookEntity>> = bookDao.observeBooks()
+
+    fun observeBooksIncludingRemoved(): Flow<List<BookEntity>> = bookDao.observeAllBooks()
+
+    suspend fun getBooksIncludingRemoved(): List<BookEntity> = bookDao.getAllBooks()
+
+    /** 书架用：一次取全部书的按字符进度累计值，交给 [readFraction] 算百分比。 */
+    fun observeBookReadSpans(): Flow<Map<Long, BookReadSpan>> =
+        bookDao.observeBookReadSpans().map { rows ->
+            rows.associate { row -> row.bookId to BookReadSpan(row.charsBeforeChapter, row.totalChars) }
+        }
+
+    /** 详情页用：只取一本书的按字符进度累计值。 */
+    fun observeBookReadSpan(bookId: Long): Flow<BookReadSpan?> =
+        bookDao.observeBookReadSpan(bookId).map { row ->
+            row?.let { BookReadSpan(it.charsBeforeChapter, it.totalChars) }
+        }
+
+    suspend fun getBooks(): List<BookEntity> = bookDao.getBooks()
+
+    fun observeBook(bookId: Long): Flow<BookEntity?> = bookDao.observeBook(bookId)
+
+    fun observeChapters(bookId: Long): Flow<List<ChapterEntity>> =
+        bookDao.observeChapters(bookId)
+
+    fun observeTocEntries(bookId: Long): Flow<List<BookTocEntryEntity>> =
+        bookDao.observeTocEntries(bookId)
+
+    fun observeBookmarks(bookId: Long): Flow<List<BookmarkEntity>> =
+        bookDao.observeBookmarks(bookId)
+
+    fun observeReadingDays(bookId: Long): Flow<List<ReadingDailyEntity>> =
+        bookDao.observeReadingDays(bookId)
+
+    fun observeAllReadingDays(): Flow<List<ReadingDailyEntity>> =
+        bookDao.observeAllReadingDays()
+
+    fun observeReadingHours(start: Long, end: Long): Flow<List<com.mozhi.reader.core.database.entity.ReadingHourlyEntity>> =
+        database.readingHourlyDao().observeBetween(start, end)
+
+    suspend fun getBook(bookId: Long): BookEntity? = bookDao.getBook(bookId)
+
+    suspend fun getEpubBooksMissingCovers(): List<BookEntity> =
+        bookDao.getBooksMissingCovers(BookSourceType.EPUB)
+
+    suspend fun getEpubBooksMissingToc(): List<BookEntity> =
+        bookDao.getBooksMissingToc(BookSourceType.EPUB)
+
+    suspend fun getEpubBooks(): List<BookEntity> = bookDao.getBooksBySource(BookSourceType.EPUB)
+
+    suspend fun updateChapterTitle(bookId: Long, chapterIndex: Int, title: String) {
+        bookDao.updateChapterTitle(bookId, chapterIndex, title)
+    }
+
+    suspend fun updateBookCover(bookId: Long, coverPath: String) {
+        bookDao.updateBookCover(bookId, coverPath)
+    }
+
+    /** 用户在详情页手改书名/作者/标签。 */
+    suspend fun updateBookMetadata(
+        bookId: Long,
+        title: String,
+        author: String,
+        tags: List<String>
+    ) {
+        bookDao.updateBookMetadata(
+            bookId = bookId,
+            title = title.trim(),
+            author = author.trim(),
+            tags = tags.joinToString(TAG_SEPARATOR) { it.trim() }.trim()
+        )
+    }
+
+    /**
+     * 手动标记阅读状态；传 null 表示交还给按进度自动推导。
+     * 标为已读完/搁置只写这一列，不动 lastRead*，回顾旧章不会把标记冲掉。
+     */
+    suspend fun setReadState(bookId: Long, state: BookReadState?) {
+        bookDao.updateReadState(bookId, state?.name)
+    }
+
+    suspend fun setPinned(bookId: Long, pinned: Boolean) {
+        bookDao.updatePinnedAt(bookId, if (pinned) System.currentTimeMillis() else 0L)
+    }
+
+    /**
+     * 换封面。旧文件在新文件落盘后才删，中途失败最坏是留一个孤儿文件而不是丢封面；
+     * 且只删应用私有目录内的，绝不碰用户相册里的原图。
+     */
+    suspend fun replaceBookCover(bookId: Long, coverPath: String?) {
+        val previous = bookDao.getBook(bookId)?.coverPath
+        bookDao.replaceBookCover(bookId, coverPath)
+        if (previous != null && previous != coverPath) {
+            File(previous).takeIf {
+                it.isFile && it.isInsideAppStorage() && !it.isImageLibraryAsset()
+            }?.delete()
+        }
+    }
+
+    /**
+     * 清理可重新抽取的 EPUB 封面：删文件并置空 coverPath，这样封面补齐任务下次能重建。
+     * 用户手选的封面与 TXT 书的封面不在范围内。
+     *
+     * @return 释放的字节数
+     */
+    suspend fun clearReExtractableCovers(): Long {
+        val books = bookDao.getBooksWithReExtractableCovers().filter { File(it.epubPath).isFile }
+        if (books.isEmpty()) return 0L
+        var freed = 0L
+        val cleared = mutableListOf<Long>()
+        books.forEach { book ->
+            val file = book.coverPath?.let(::File)
+            if (file != null && file.isFile && file.isInsideAppStorage()) {
+                val size = file.length()
+                if (file.delete()) freed += size
+            }
+            cleared += book.id
+        }
+        bookDao.clearCoverPaths(cleared)
+        return freed
+    }
+
+    suspend fun getChapters(bookId: Long): List<ChapterEntity> = bookDao.getChapters(bookId)
+
+    suspend fun getChapter(bookId: Long, chapterIndex: Int): ChapterEntity? =
+        bookDao.getChapter(bookId, chapterIndex)
+
+    suspend fun getTotalCharacterCount(bookId: Long): Long =
+        bookDao.getTotalCharacterCount(bookId)
+
+    suspend fun getCharacterCountBefore(bookId: Long, chapterIndex: Int): Long =
+        bookDao.getCharacterCountBefore(bookId, chapterIndex)
+
+    suspend fun getTagNames(bookId: Long): List<String> = bookDao.getTagNames(bookId)
+
+    suspend fun getReadingDays(bookId: Long): List<ReadingDailyEntity> =
+        bookDao.getReadingDays(bookId)
+
+    suspend fun getTocEntries(bookId: Long): List<BookTocEntryEntity> =
+        bookDao.getTocEntries(bookId)
+
+    suspend fun getChapterTitle(bookId: Long, chapterIndex: Int): String? =
+        bookDao.getChapterTitle(bookId, chapterIndex)
+
+    suspend fun insertBook(
+        book: BookEntity,
+        chapters: List<ChapterDraft>,
+        tocEntries: List<BookTocEntryDraft> = chapters.toFlatTocEntries()
+    ): Long =
+        database.withTransaction {
+            val bookId = bookDao.insertBook(book)
+            bookDao.insertChapters(
+                chapters.map { chapter ->
+                    ChapterEntity(
+                        bookId = bookId,
+                        chapterIndex = chapter.index,
+                        title = chapter.title,
+                        href = chapter.href,
+                        charCount = chapter.charCount
+                    )
+                }
+            )
+            if (tocEntries.isNotEmpty()) {
+                bookDao.insertTocEntries(tocEntries.map { it.toEntity(bookId) })
+            }
+            bookId
+        }
+
+    suspend fun replaceBookToc(bookId: Long, entries: List<BookTocEntryDraft>) {
+        database.withTransaction {
+            bookDao.deleteTocEntriesForBook(bookId)
+            if (entries.isNotEmpty()) {
+                bookDao.insertTocEntries(entries.map { it.toEntity(bookId) })
+            }
+        }
+    }
+
+    suspend fun saveProgress(
+        bookId: Long,
+        locatorJson: String,
+        chapterIndex: Int,
+        charOffset: Int = 0,
+        reachedEnd: Boolean = false
+    ) {
+        bookDao.updateProgress(
+            bookId = bookId,
+            locatorJson = locatorJson,
+            chapterIndex = chapterIndex,
+            charOffset = charOffset,
+            readAt = System.currentTimeMillis(),
+            reachedEnd = reachedEnd
+        )
+    }
+
+    /**
+     * Advances only the monotonic spoiler boundary to the end of text actually displayed.
+     * Reader callers must supply original-source UTF-16 coordinates, never prefetched/generated text.
+     * Does not change resume locator/position, lastReadAt, or reachedEnd.
+     */
+    suspend fun markVisibleReadEnd(bookId: Long, chapterIndex: Int, charOffset: Int) {
+        bookDao.markVisibleReadEnd(bookId, chapterIndex, charOffset)
+    }
+
+    suspend fun booksNeedingText(): List<BookEntity> =
+        bookDao.getBooksBelowTextVersion(CURRENT_TEXT_VERSION)
+
+    /**
+     * Writes the book's chapter bodies to disk and records the byte ranges.
+     *
+     * The blob is written before the transaction so a crash leaves `textVersion` untouched and the
+     * next run redoes the whole book; a half-written index is never observable.
+     */
+    /**
+     * Writes the text blob and byte ranges. [markReady] flips `textVersion` in the same
+     * transaction; legacy migration passes false so the version only flips after the stored
+     * positions were converted — readers gate on `textVersion`, so they must never observe the
+     * window between the two.
+     */
+    suspend fun materializeBookText(
+        bookId: Long,
+        chapters: List<ChapterTextInput>,
+        markReady: Boolean = true
+    ) {
+        val ranges = withContext(Dispatchers.IO) { textWriter.write(textStore.textFile(bookId), chapters) }
+        textStore.invalidate(bookId)
+        database.withTransaction {
+            ranges.forEach { range ->
+                bookDao.updateChapterTextRange(
+                    bookId = bookId,
+                    chapterIndex = range.index,
+                    byteOffset = range.byteOffset,
+                    byteLength = range.byteLength,
+                    charCount = range.charCount
+                )
+            }
+            if (markReady) bookDao.updateTextVersion(bookId, CURRENT_TEXT_VERSION)
+        }
+    }
+
+    /** Replaces exactly one selected range and returns the new cursor position after the edit. */
+    suspend fun replaceChapterText(
+        bookId: Long,
+        chapterIndex: Int,
+        range: IntRange,
+        replacement: String
+    ): Int {
+        val chapters = bookDao.getChapters(bookId)
+        val current = chapters.firstOrNull { it.chapterIndex == chapterIndex }
+            ?: error("章节不存在")
+        val body = readChapterText(bookId, current)
+        val start = range.first.coerceIn(0, body.length)
+        val endExclusive = (range.last + 1).coerceIn(start, body.length)
+        val updated = body.replaceRange(start, endExclusive, replacement)
+        if (updated == body) return start + replacement.length
+        val inputs = chapters.map { chapter ->
+            ChapterTextInput(
+                index = chapter.chapterIndex,
+                body = if (chapter.chapterIndex == chapterIndex) updated else {
+                    readChapterText(bookId, chapter)
+                }
+            )
+        }
+        materializeBookText(bookId, inputs)
+        return (start + replacement.length).coerceIn(0, updated.length)
+    }
+
+    suspend fun previewTextReplacementRules(bookId: Long, rules: List<ReaderTextReplacementRule>): TextCleanupPreview = withContext(Dispatchers.Default) {
+        val active = rules.filter { it.enabled && !it.forListenOnly }
+        active.forEach { require(it.validationError() == null) { "规则「${it.name}」无效" } }
+        val chapters = bookDao.getChapters(bookId)
+        val sources = chapters.map { it.chapterIndex to readChapterText(bookId, it) }
+        var matches = 0
+        var changed = 0
+        val examples = mutableListOf<TextCleanupChange>()
+        sources.zip(chapters).forEach { (source, chapter) ->
+            val (after, count) = cleanText(source.second, active)
+            matches += count
+            if (after != source.second) {
+                changed++
+                if (examples.size < 12) {
+                    val first = (0 until minOf(source.second.length, after.length)).firstOrNull { source.second[it] != after[it] }
+                        ?: minOf(source.second.length, after.length)
+                    val start = (first - 80).coerceAtLeast(0)
+                    examples += TextCleanupChange(chapter.chapterIndex, chapter.title,
+                        source.second.drop(start).take(700), after.drop(start).take(700))
+                }
+            }
+        }
+        TextCleanupPreview(active, cleanupRevision(sources), matches, changed, examples)
+    }
+
+    /** Recheck the preview revision before writing; listening-only rules never rewrite book text. */
+    suspend fun applyTextReplacementRules(
+        bookId: Long,
+        rules: List<ReaderTextReplacementRule>,
+        expectedRevision: String? = null
+    ): Int = withContext(Dispatchers.Default) {
+        val activeRules = rules.filter { it.enabled && !it.forListenOnly }
+        activeRules.forEach { rule ->
+            require(rule.validationError() == null) { "规则「${rule.name}」无效" }
+        }
+        if (activeRules.isEmpty()) return@withContext 0
+        val chapters = bookDao.getChapters(bookId)
+        var matches = 0
+        val sources = chapters.map { it.chapterIndex to readChapterText(bookId, it) }
+        require(expectedRevision == null || expectedRevision == cleanupRevision(sources)) { "正文已变化，请重新预览后应用" }
+        var changed = false
+        val inputs = sources.map { (index, body) ->
+            val (cleaned, count) = cleanText(body, activeRules)
+            matches += count
+            changed = changed || cleaned != body
+            ChapterTextInput(index = index, body = cleaned)
+        }
+        if (changed) materializeBookText(bookId, inputs)
+        matches
+    }
+
+    /** Replaces the chapter table and text blob together after TXT chapter recognition changes. */
+    suspend fun replaceBookChapters(bookId: Long, chapters: List<EditableChapterDraft>) {
+        require(chapters.isNotEmpty()) { "没有可写入的章节" }
+        val book = requireNotNull(bookDao.getBook(bookId)) { "书籍不存在" }
+        val normalized = chapters.sortedBy(EditableChapterDraft::index).mapIndexed { index, chapter ->
+            chapter.copy(index = index)
+        }
+        val ranges = withContext(Dispatchers.IO) { textWriter.write(
+            textStore.textFile(bookId),
+            normalized.map { chapter -> ChapterTextInput(chapter.index, chapter.body) }
+        ) }
+        textStore.invalidate(bookId)
+        database.withTransaction {
+            bookDao.deleteChaptersForBook(bookId)
+            val rangeByIndex = ranges.associateBy(ChapterTextRange::index)
+            bookDao.insertChapters(
+                normalized.map { chapter ->
+                    val range = requireNotNull(rangeByIndex[chapter.index])
+                    ChapterEntity(
+                        bookId = bookId,
+                        chapterIndex = chapter.index,
+                        title = chapter.title,
+                        href = chapter.href,
+                        charCount = range.charCount,
+                        textByteOffset = range.byteOffset,
+                        textByteLength = range.byteLength
+                    )
+                }
+            )
+            bookDao.deleteTocEntriesForBook(bookId)
+            bookDao.insertTocEntries(
+                normalized.map { chapter ->
+                    BookTocEntryDraft(
+                        orderIndex = chapter.index,
+                        title = chapter.title,
+                        href = chapter.href,
+                        depth = 0,
+                        parentOrderIndex = null,
+                        chapterIndex = chapter.index,
+                        hasChildren = false
+                    ).toEntity(bookId)
+                }
+            )
+            bookDao.updateBook(
+                book.copy(
+                    totalChapters = normalized.size,
+                    lastReadLocator = null,
+                    lastReadChapterIndex = 0,
+                    lastReadCharOffset = 0,
+                    maxReachedChapterIndex = 0,
+                    maxReachedCharOffset = 0,
+                    textVersion = CURRENT_TEXT_VERSION
+                )
+            )
+        }
+    }
+
+    suspend fun markTextReady(bookId: Long) {
+        bookDao.updateTextVersion(bookId, CURRENT_TEXT_VERSION)
+    }
+
+    suspend fun compactBookText(bookId: Long): Long = compactBookTextWithResult(bookId).freedBytes
+
+    /** Verify the only remaining text representation before dropping an old generated TXT EPUB. */
+    suspend fun discardGeneratedTxtEpub(bookId: Long): Long = BookContentMutation.withBook(bookId) {
+        withContext(Dispatchers.IO) {
+            val book = getBook(bookId) ?: return@withContext 0L
+            if (book.sourceType != BookSourceType.TXT || book.epubPath.isBlank() || book.removedAt > 0 ||
+                book.textVersion < CURRENT_TEXT_VERSION) return@withContext 0L
+            val chapters = getChapters(bookId).sortedBy { it.chapterIndex }
+            if (chapters.isEmpty() || chapters.size != book.totalChapters ||
+                chapters.map { it.chapterIndex } != chapters.indices.toList()) return@withContext 0L
+            chapters.forEach { readChapterTextStrict(bookId, it) }
+            val archive = File(book.epubPath)
+            if (bookDao.clearGeneratedTxtEpub(bookId, book.epubPath) == 0) return@withContext 0L
+            val ownedRoot = File(context.filesDir, "books").canonicalFile.toPath()
+            if (!archive.isFile || !archive.canonicalFile.toPath().startsWith(ownedRoot) ||
+                bookDao.getAllBooks().any { it.epubPath == book.epubPath }) return@withContext 0L
+            val size = archive.length()
+            if (archive.delete()) size else 0L
+        }
+    }
+
+    suspend fun compactBookTextWithResult(bookId: Long): BookTextCompactionResult = BookContentMutation.withBook(bookId) {
+        if (getBook(bookId)?.removedAt != 0L) BookTextCompactionResult(BookTextCompactionOutcome.MISSING)
+        else textStore.compactWithResult(bookId)
+    }
+
+    suspend fun readChapterText(bookId: Long, chapter: ChapterEntity): String =
+        textStore.readChapter(bookId, chapter.textByteOffset, chapter.textByteLength)
+
+    /** Same text.mz coordinates as the reader, with explicit retrieval failure semantics. */
+    suspend fun readChapterTextStrict(bookId: Long, chapter: ChapterEntity): String {
+        val body = textStore.readChapterStrict(bookId, chapter.textByteOffset, chapter.textByteLength)
+        if (body.length != chapter.charCount) {
+            throw BookTextException("INVALID_TEXT", "章节正文与 UTF-16 坐标元数据不一致")
+        }
+        return body
+    }
+
+    suspend fun bookTextRevision(bookId: Long): String {
+        val book = getBook(bookId) ?: throw BookTextException("SOURCE_MISSING", "书籍已不存在")
+        val chapters = getChapters(bookId).sortedBy { it.chapterIndex }
+        val metadata = buildString {
+            append(book.id).append(':').append(book.importedAt).append(':')
+            append(book.textVersion).append(':').append(book.totalChapters).append(';')
+            chapters.forEach { chapter ->
+                append(chapter.chapterIndex).append(':').append(chapter.charCount).append(':')
+                append(chapter.textByteOffset).append(':').append(chapter.textByteLength).append(';')
+            }
+            append(textStore.contentRevision(bookId))
+        }
+        return java.security.MessageDigest.getInstance("SHA-256")
+            .digest(metadata.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+    }
+
+    suspend fun getBookmarks(bookId: Long): List<BookmarkEntity> = bookDao.getBookmarks(bookId)
+
+    suspend fun resetReadingHighWater(bookId: Long) {
+        bookDao.resetReadingHighWater(bookId)
+    }
+
+    suspend fun updateReadPosition(bookId: Long, chapterIndex: Int, charOffset: Int) {
+        bookDao.updateReadPosition(bookId, chapterIndex, charOffset)
+    }
+
+    suspend fun updateBookmarkPosition(bookmarkId: Long, chapterIndex: Int, charOffset: Int) {
+        bookDao.updateBookmarkPosition(bookmarkId, chapterIndex, charOffset)
+    }
+
+    suspend fun addBookmark(bookId: Long, locatorJson: String, label: String): Long =
+        bookDao.insertBookmark(
+            BookmarkEntity(
+                bookId = bookId,
+                locatorJson = locatorJson,
+                label = label,
+                createdAt = System.currentTimeMillis()
+            )
+        )
+
+    /** New-track bookmark: locatorJson is the stable anchor; integer position is the fallback. */
+    suspend fun addBookmark(
+        bookId: Long,
+        chapterIndex: Int,
+        charOffset: Int,
+        locatorJson: String,
+        excerpt: String,
+        label: String
+    ): Long = bookDao.insertBookmark(
+        BookmarkEntity(
+            bookId = bookId,
+            locatorJson = locatorJson,
+            chapterIndex = chapterIndex,
+            charOffset = charOffset,
+            excerpt = excerpt,
+            label = label,
+            createdAt = System.currentTimeMillis()
+        )
+    )
+
+    suspend fun deleteBookmark(bookmarkId: Long) {
+        bookDao.deleteBookmark(bookmarkId)
+    }
+
+    suspend fun recordReadingDuration(
+        bookId: Long,
+        durationMs: Long,
+        recordedAt: Long = System.currentTimeMillis()
+    ) {
+        if (durationMs < MIN_READING_DURATION_MS) return
+        val segments = readingTimeSlices(durationMs, recordedAt, ZoneId.systemDefault())
+        database.withTransaction {
+            // A queued reader flush may arrive after the user permanently deleted the book.
+            if (bookDao.getBook(bookId) == null) return@withTransaction
+            segments.forEach { segment ->
+                bookDao.insertReadingDay(
+                    ReadingDailyEntity(
+                        bookId = bookId,
+                        epochDay = segment.epochDay,
+                        durationMs = 0,
+                        lastReadAt = segment.lastReadAt
+                    )
+                )
+                bookDao.addReadingDuration(
+                    bookId = bookId,
+                    epochDay = segment.epochDay,
+                    durationMs = segment.durationMs,
+                    lastReadAt = segment.lastReadAt
+                )
+                database.readingHourlyDao().insert(com.mozhi.reader.core.database.entity.ReadingHourlyEntity(
+                    bookId, segment.epochDay, segment.hour, 0L))
+                database.readingHourlyDao().addDuration(bookId, segment.epochDay, segment.hour, segment.durationMs)
+            }
+        }
+    }
+
+    suspend fun deleteBook(book: BookEntity) = removeBookData(book, deleteRecords = true)
+
+    suspend fun removeBookKeepingRecords(book: BookEntity) = removeBookData(book, deleteRecords = false)
+
+    private suspend fun removeBookData(book: BookEntity, deleteRecords: Boolean) =
+        BookContentMutation.withBook(book.id) { removeBookDataLocked(book, deleteRecords) }
+
+    private suspend fun removeBookDataLocked(book: BookEntity, deleteRecords: Boolean) = withContext(Dispatchers.IO) {
+        val conversationIds = database.withTransaction {
+            val ids = database.chatDao().getConversationIdsForBook(book.id)
+            if (deleteRecords) bookDao.deleteBook(book.id)
+            else bookDao.markRemoved(book.id, System.currentTimeMillis().coerceAtLeast(1L))
+            database.proactiveAnnotationJobDao().deleteForBook(book.id)
+            database.shelfOrganizationDao().deleteEmptyCollections()
+            ids
+        }
+        // 向量清理失败不阻塞删书（孤儿切片按 bookId 隔离，检索不到）。
+        runCatching { VectorQueries.removeChunksForBook(vectorStore.get(), book.id) }
+        textStore.delete(book.id)
+        mediaStore.delete(book.id)
+        layoutStore.delete(book.id)
+        File(context.filesDir, "speech-cache/${book.id}").deleteRecursively()
+        File(context.cacheDir, "agent-speech/${book.id}").deleteRecursively()
+        val otherBooks = bookDao.getAllBooks().filterNot { it.id == book.id }
+        File(book.epubPath).takeIf { original ->
+            original.isFile && original.isInsideAppStorage() && otherBooks.none { it.epubPath == book.epubPath }
+        }?.delete()
+        if (deleteRecords) {
+            imageReferenceCleanup.get().forDeletedBook(book.id)
+            runCatching { VectorQueries.removeMemoriesForBook(vectorStore.get(), book.id) }
+            File(context.filesDir, "illustrations/${book.id}").deleteRecursively()
+            conversationIds.forEach { id ->
+                File(context.filesDir, "attachments/$id").deleteRecursively()
+                runCatching { VectorQueries.removeMemoriesForConversation(vectorStore.get(), id) }
+            }
+            book.coverPath?.let(::File)?.takeIf { cover ->
+                cover.isFile && cover.isInsideAppStorage() && !cover.isImageLibraryAsset() &&
+                    otherBooks.none { it.coverPath == book.coverPath }
+            }?.delete()
+        }
+        val contentRoots = listOf("book-text", "book-media", "book-layout", "speech-cache")
+            .map { File(context.filesDir, "$it/${book.id}") } + File(context.cacheDir, "agent-speech/${book.id}")
+        val personalRoots = if (deleteRecords) listOf(File(context.filesDir, "illustrations/${book.id}")) +
+            conversationIds.map { File(context.filesDir, "attachments/$it") } else emptyList()
+        val original = File(book.epubPath)
+        val originalRemains = original.isFile && original.isInsideAppStorage() && otherBooks.none { it.epubPath == book.epubPath }
+        check(!originalRemains && (contentRoots + personalRoots).none { root -> root.exists() && root.walkTopDown().any(File::isFile) }) {
+            "记录处理已完成，但部分文件未能清理，请到存储管理重试"
+        }
+    }
+
+    private fun File.isInsideAppStorage(): Boolean {
+        val appRoot = context.filesDir.canonicalFile
+        return canonicalFile.toPath().startsWith(appRoot.toPath())
+    }
+
+    /** 图片库文件可被多本书和阅读背景复用，书籍生命周期不得删除它。 */
+    private fun File.isImageLibraryAsset(): Boolean {
+        val imageRoot = File(
+            context.filesDir,
+            com.mozhi.reader.core.datastore.ReaderImageImporter.IMAGE_LIBRARY_DIRECTORY
+        ).canonicalFile
+        return canonicalFile.parentFile == imageRoot
+    }
+
+    companion object {
+        const val CURRENT_TEXT_VERSION = 4
+        const val TAG_SEPARATOR = ","
+        private const val MIN_READING_DURATION_MS = 1_000L
+    }
+
+}
+
+private fun List<ChapterDraft>.toFlatTocEntries(): List<BookTocEntryDraft> = map { chapter ->
+    BookTocEntryDraft(
+        orderIndex = chapter.index,
+        title = chapter.title,
+        href = chapter.href,
+        depth = 0,
+        parentOrderIndex = null,
+        chapterIndex = chapter.index,
+        hasChildren = false
+    )
+}
+
+private fun BookTocEntryDraft.toEntity(bookId: Long): BookTocEntryEntity = BookTocEntryEntity(
+    bookId = bookId,
+    orderIndex = orderIndex,
+    title = title,
+    href = href,
+    depth = depth,
+    parentOrderIndex = parentOrderIndex,
+    chapterIndex = chapterIndex,
+    hasChildren = hasChildren
+)

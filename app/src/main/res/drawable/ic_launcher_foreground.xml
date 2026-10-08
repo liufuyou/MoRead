@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Transparent artwork, centered inside the adaptive icon safe area. -->
+<bitmap xmlns:android="http://schemas.android.com/apk/res/android"
+    android:src="@drawable/launcher_artwork"
+    android:gravity="center"
+    android:filter="true"
+    android:antialias="true" />

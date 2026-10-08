@@ -1,0 +1,68 @@
+{
+    "fixture": "02-inline-emoji",
+    "bodyLength": 56,
+    "pages": [
+        {
+            "index": 0,
+            "chapterPosition": 0,
+            "charLength": 55,
+            "height": 71.100006,
+            "backgroundColorArgb": null,
+            "backgroundImagePath": null,
+            "immersive": false,
+            "hideHeader": false,
+            "decorations": [],
+            "lines": [
+                {
+                    "chapterPosition": 0,
+                    "charLength": 28,
+                    "lineTop": 0.0,
+                    "lineBottom": 20.0,
+                    "startX": 0.0,
+                    "image": null,
+                    "images": [],
+                    "glyphImages": [
+                        {
+                            "path": "fixture://OEBPS/Images/emoji.png",
+                            "left": 122.09524,
+                            "top": 2.5,
+                            "width": 16.0,
+                            "height": 16.0
+                        }
+                    ],
+                    "decorations": []
+                },
+                {
+                    "chapterPosition": 28,
+                    "charLength": 3,
+                    "lineTop": 20.800001,
+                    "lineBottom": 40.800003,
+                    "startX": 0.0,
+                    "image": null,
+                    "images": [],
+                    "glyphImages": [],
+                    "decorations": []
+                },
+                {
+                    "chapterPosition": 32,
+                    "charLength": 24,
+                    "lineTop": 49.600002,
+                    "lineBottom": 71.100006,
+                    "startX": 0.0,
+                    "image": null,
+                    "images": [],
+                    "glyphImages": [
+                        {
+                            "path": "fixture://OEBPS/Images/emoji2.png",
+                            "left": 90.0,
+                            "top": 49.600006,
+                            "width": 20.0,
+                            "height": 20.0
+                        }
+                    ],
+                    "decorations": []
+                }
+            ]
+        }
+    ]
+}

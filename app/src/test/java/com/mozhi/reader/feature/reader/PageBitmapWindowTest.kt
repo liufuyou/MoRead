@@ -1,0 +1,113 @@
+package com.mozhi.reader.feature.reader
+
+import com.mozhi.reader.core.datastore.PageTurnAnimation
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class PageBitmapWindowTest {
+
+    @Test
+    fun `spread window rotates the composite without splitting leaves`() {
+        val previous = listOf("previous-left", "previous-right")
+        val current = listOf("current-left", "current-right")
+        val next = listOf("next-left", "blank-right")
+        val rotated = rotatePageWindow(previous, current, next, PageTurnDirection.NEXT)
+        org.junit.Assert.assertSame(next, rotated.current)
+        org.junit.Assert.assertSame(current, rotated.previous)
+        org.junit.Assert.assertSame(previous, rotated.reusable)
+    }
+
+    @Test
+    fun `next turn reuses previous buffer for new next page`() {
+        val rotated = rotatePageWindow("previous", "current", "next", PageTurnDirection.NEXT)
+
+        assertEquals("current", rotated.previous)
+        assertEquals("next", rotated.current)
+        assertNull(rotated.next)
+        assertEquals("previous", rotated.reusable)
+    }
+
+    @Test
+    fun `previous turn reuses next buffer for new previous page`() {
+        val rotated = rotatePageWindow("previous", "current", "next", PageTurnDirection.PREVIOUS)
+
+        assertNull(rotated.previous)
+        assertEquals("previous", rotated.current)
+        assertEquals("current", rotated.next)
+        assertEquals("next", rotated.reusable)
+    }
+
+    @Test
+    fun `committed turn refresh stays synchronous while animation is finishing`() {
+        assertTrue(
+            shouldRefreshPageWindowImmediately(
+                turnRunning = true,
+                relativePosition = 0,
+                hasPreparedTurn = true
+            )
+        )
+    }
+
+    @Test
+    fun `ordinary refresh waits until active turn finishes`() {
+        assertFalse(
+            shouldRefreshPageWindowImmediately(
+                turnRunning = true,
+                relativePosition = 0,
+                hasPreparedTurn = false
+            )
+        )
+        assertFalse(
+            shouldRefreshPageWindowImmediately(
+                turnRunning = true,
+                relativePosition = 1,
+                hasPreparedTurn = true
+            )
+        )
+    }
+
+    @Test
+    fun `refresh is immediate when no turn is running`() {
+        assertTrue(
+            shouldRefreshPageWindowImmediately(
+                turnRunning = false,
+                relativePosition = 1,
+                hasPreparedTurn = false
+            )
+        )
+    }
+
+    @Test
+    fun `only simulation embeds background in page snapshots`() {
+        assertTrue(PageTurnAnimation.SIMULATION.usesEmbeddedPageBackground())
+        assertFalse(PageTurnAnimation.COVER.usesEmbeddedPageBackground())
+        assertFalse(PageTurnAnimation.SLIDE.usesEmbeddedPageBackground())
+        assertFalse(PageTurnAnimation.NONE.usesEmbeddedPageBackground())
+    }
+
+    @Test
+    fun `a burst of updates during a turn is published once against the final window`() {
+        val queue = PageWindowRefreshQueue()
+        repeat(20) {
+            assertNull(queue.request(if (it % 2 == 0) 0 else 1, true, false))
+        }
+        assertEquals(0, queue.finishTurn())
+        assertNull(queue.finishTurn())
+        assertEquals(-1, queue.request(-1, false, false))
+    }
+
+    @Test
+    fun `pending annotations never defer committed window rotation or leak into the next turn`() {
+        val queue = PageWindowRefreshQueue()
+        assertNull(queue.request(0, true, false))
+        assertEquals(0, queue.request(0, true, true))
+        assertEquals(0, queue.finishTurn())
+        assertNull(queue.finishTurn())
+        assertNull(queue.request(-1, true, false))
+        assertEquals(0, queue.finishTurn())
+        assertNull(queue.finishTurn())
+    }
+}

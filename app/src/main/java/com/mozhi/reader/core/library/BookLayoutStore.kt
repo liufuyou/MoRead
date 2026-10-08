@@ -1,0 +1,459 @@
+package com.mozhi.reader.core.library
+
+import android.content.Context
+import com.mozhi.reader.core.epub.css.CssTokenType
+import com.mozhi.reader.core.epub.css.CssTokenizer
+import com.mozhi.reader.core.epub.dom.EpubDomChapter
+import com.mozhi.reader.core.epub.dom.EpubDomNode
+import com.mozhi.reader.core.epub.dom.EpubV9DomAdapter
+import com.mozhi.reader.feature.importer.EpubLayoutDocumentParser
+import dagger.hilt.android.qualifiers.ApplicationContext
+import java.io.File
+import java.security.MessageDigest
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+import javax.inject.Inject
+import javax.inject.Singleton
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+
+@Singleton
+class BookLayoutStore @Inject constructor(
+    @ApplicationContext private val context: Context,
+    parser: EpubLayoutDocumentParser = EpubLayoutDocumentParser()
+) {
+    private val archiveCache = BookLayoutCache(context, parser)
+    private val packageCache = object : LinkedHashMap<Long, EpubLayoutPackage>(4, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, EpubLayoutPackage>): Boolean =
+            size > PACKAGE_CACHE_SIZE
+    }
+
+    /** Import retains only the package/chapter index and fonts; DOM is parsed on first use. */
+    suspend fun initialize(
+        bookId: Long, epubFile: File, layoutPackage: EpubLayoutPackage, chapters: List<EpubLayoutChapterInput>
+    ) = withContext(Dispatchers.IO) {
+        val sorted = chapters.sortedBy(EpubLayoutChapterInput::chapterIndex)
+        require(sorted.map { it.chapterIndex } == sorted.indices.toList()) { "EPUB 章节索引不连续" }
+        val refs = sorted.map { EpubLayoutChapterRef(it.chapterIndex, it.href, it.document.textLength, "", it.document.immersivePage) }
+        storeArchiveIndex(bookId, epubFile, layoutPackage.copy(chapters = refs))
+    }
+
+    /** Upgrade existing indexes without reparsing the book or rewriting canonical text. */
+    suspend fun adoptArchive(bookId: Long, epubFile: File, expectedTextLengths: List<Int>): Boolean = withContext(Dispatchers.IO) {
+        val pkg = readPackage(bookId) ?: return@withContext false
+        if (pkg.schemaVersion !in setOf(9, EpubLayoutPackage.CURRENT_SCHEMA_VERSION)) return@withContext false
+        if (pkg.sourceArchive != null) {
+            val refs = pkg.chapters.sortedBy { it.chapterIndex }
+            if (refs.map { it.chapterIndex } != expectedTextLengths.indices.toList()) return@withContext false
+            if (refs.map { it.textLength } != expectedTextLengths) {
+                // Canonical text may have been edited. Refresh only the cheap coordinate index;
+                // an incompatible original DOM falls back to text instead of undoing those edits.
+                storeArchiveIndex(bookId, epubFile, pkg.copy(chapters = refs.map { it.copy(textLength = expectedTextLengths[it.chapterIndex]) }))
+            }
+            retireMaterializedFiles(bookId, pkg)
+            archiveCache.trim(bookId)
+            return@withContext true
+        }
+        val refs = pkg.chapters.sortedBy { it.chapterIndex }
+        if (refs.map { it.chapterIndex } != expectedTextLengths.indices.toList() || !epubFile.isFile) return@withContext false
+        storeArchiveIndex(bookId, epubFile, pkg.copy(chapters = refs.map {
+            it.copy(fileName = "", textLength = expectedTextLengths[it.chapterIndex])
+        }))
+        true
+    }
+
+    private fun storeArchiveIndex(bookId: Long, epubFile: File, pkg: EpubLayoutPackage) {
+        val root = directory(bookId).apply { mkdirs() }
+        val stored = pkg.copy(schemaVersion = EpubLayoutPackage.CURRENT_SCHEMA_VERSION,
+            parserRevision = EpubLayoutPackage.CURRENT_PARSER_REVISION,
+            sourceArchive = epubFile.portableArchivePath(context.filesDir))
+        extractResources(epubFile, stored, File(root, RESOURCE_DIRECTORY), emptyList(), fontsOnly = true)
+        val temporary = File.createTempFile("index-", ".tmp", root)
+        try {
+            temporary.writeText(json.encodeToString(stored))
+            Files.move(temporary.toPath(), File(root, INDEX_FILE).toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+        } finally { temporary.delete() }
+        synchronized(packageCache) { packageCache[bookId] = stored }
+        // The archive-backed index is durable before removing any rebuildable sidecars.
+        retireMaterializedFiles(bookId, stored)
+        archiveCache.delete(bookId)
+    }
+
+    private fun retireMaterializedFiles(bookId: Long, pkg: EpubLayoutPackage) {
+        val root = directory(bookId)
+        val marker = File(root, ARCHIVE_STORAGE_MARKER)
+        if (marker.isFile) return
+        var complete = true
+        listOf(CHAPTER_DIRECTORY, LEGACY_CHAPTER_DIRECTORY).forEach { name ->
+            val old = File(root, name)
+            if (old.exists() && !old.deleteRecursively()) complete = false
+        }
+        pkg.resources.filter { it.kind != EpubLayoutResourceKind.FONT }.forEach { resource ->
+            val resources = File(root, RESOURCE_DIRECTORY)
+            listOfNotNull(File(resources, resourceFileName(resource.archivePath)), safeChild(resources, resource.archivePath))
+                .filter(File::isFile).forEach { if (!it.delete()) complete = false }
+        }
+        File(root, COMPACT_MARKER).delete()
+        if (complete) marker.writeText("1")
+    }
+
+    suspend fun replace(
+        bookId: Long,
+        epubFile: File,
+        layoutPackage: EpubLayoutPackage,
+        chapters: List<EpubLayoutChapterInput>
+    ) = withContext(Dispatchers.IO) {
+        require(layoutPackage.schemaVersion == EpubLayoutPackage.CURRENT_SCHEMA_VERSION) {
+            "EPUB 布局版本不受支持"
+        }
+        val sortedChapters = chapters.sortedBy(EpubLayoutChapterInput::chapterIndex)
+        require(sortedChapters.map(EpubLayoutChapterInput::chapterIndex) == sortedChapters.indices.toList()) {
+            "EPUB 布局章节索引不连续"
+        }
+        val root = directory(bookId)
+        val staging = File(root.parentFile, "${root.name}.tmp-${System.nanoTime()}")
+        staging.deleteRecursively()
+        staging.mkdirs()
+        try {
+            val chapterDirectory = File(staging, CHAPTER_DIRECTORY).apply { mkdirs() }
+            val legacyDirectory = File(staging, LEGACY_CHAPTER_DIRECTORY).apply { mkdirs() }
+            // 没有任何样式表的书，排版器不会走 DOM 引擎，旧引擎仍需要完整块列表。
+            val keepLegacyBlocks = layoutPackage.stylesheets.isEmpty()
+            val refs = sortedChapters.map { input ->
+                val dom = requireNotNull(input.dom) { "EPUB v10 DOM 缺失：${input.chapterIndex}" }
+                require(dom.schemaVersion == EpubLayoutPackage.CURRENT_SCHEMA_VERSION) {
+                    "EPUB DOM 版本不受支持：${input.chapterIndex}"
+                }
+                require(dom.textLength >= 0 && dom.textLength == input.document.textLength) {
+                    "EPUB 章节布局长度无效：${input.chapterIndex}"
+                }
+                val fileName = "ch-${input.chapterIndex.toString().padStart(5, '0')}.json"
+                // DOM JSON gzip 落盘：一本精排书的章节 DOM 常有几 MB，压后约八分之一；读取按魔数识别。
+                val domFileName = "$fileName.gz"
+                GzipTextFiles.writeGzip(
+                    File(chapterDirectory, domFileName),
+                    json.encodeToString(dom.copy(chapterIndex = input.chapterIndex, href = input.href))
+                )
+                // 旧引擎的块列表只在两种情况下还会被读：没有 DOM 的老库，以及整本没有样式表、
+                // 排版器因此仍走旧引擎的书。其余情况它是同一章的第二份、且比 DOM 大三倍多的 JSON
+                // （一本 14 MB 的精排书曾为此多写 19 MB），这里只保留章级元信息。
+                val legacyDocument = if (keepLegacyBlocks) input.document else input.document.copy(blocks = emptyList())
+                File(legacyDirectory, fileName).writeText(json.encodeToString(legacyDocument))
+                EpubLayoutChapterRef(
+                    chapterIndex = input.chapterIndex,
+                    href = input.href,
+                    textLength = input.document.textLength,
+                    fileName = "$CHAPTER_DIRECTORY/$domFileName"
+                )
+            }
+            val storedPackage = layoutPackage.copy(
+                chapters = refs,
+                parserRevision = EpubLayoutPackage.CURRENT_PARSER_REVISION
+            )
+            extractResources(
+                epubFile = epubFile,
+                layoutPackage = storedPackage,
+                targetRoot = File(staging, RESOURCE_DIRECTORY),
+                chapterStyles = sortedChapters.flatMap { input ->
+                    val dom = input.dom ?: return@flatMap emptyList()
+                    buildList {
+                        addAll(dom.embeddedStylesheets)
+                        fun collect(node: EpubDomNode) {
+                            node.attributes["style"]?.let { add(EpubStylesheetText(input.href, it)) }
+                            node.children.forEach(::collect)
+                        }
+                        collect(dom.bodyNode)
+                    }
+                }
+            )
+            File(staging, INDEX_FILE).writeText(json.encodeToString(storedPackage))
+            File(staging, COMPACT_MARKER).writeText("v2")
+            root.deleteRecursively()
+            if (!staging.renameTo(root)) {
+                root.mkdirs()
+                staging.copyRecursively(root, overwrite = true)
+                staging.deleteRecursively()
+            }
+            synchronized(packageCache) { packageCache[bookId] = storedPackage }
+        } catch (error: Throwable) {
+            staging.deleteRecursively()
+            throw error
+        }
+    }
+
+    suspend fun readChapter(bookId: Long, chapterIndex: Int, expectedText: String? = null): EpubLayoutChapterBundle? =
+        withContext(Dispatchers.IO) {
+            val layoutPackage = readPackage(bookId) ?: return@withContext null
+            if (layoutPackage.schemaVersion !in setOf(9, EpubLayoutPackage.CURRENT_SCHEMA_VERSION)) {
+                return@withContext null
+            }
+            val reference = layoutPackage.chapters.firstOrNull { it.chapterIndex == chapterIndex }
+                ?: return@withContext null
+            val root = directory(bookId)
+            val archive = layoutPackage.sourceArchive?.let { resolveArchivePath(context.filesDir, it) }
+            val chapterFile = safeChild(root, reference.fileName) ?: return@withContext null
+            val (chapter, dom) = if (layoutPackage.sourceArchive != null) {
+                archiveCache.read(bookId, layoutPackage, reference, expectedText) ?: return@withContext null
+            } else if (!chapterFile.isFile) {
+                return@withContext null
+            } else if (layoutPackage.schemaVersion >= 10) {
+                val parsedDom = runCatching {
+                    json.decodeFromString(EpubDomChapter.serializer(), GzipTextFiles.readText(chapterFile))
+                }.getOrNull() ?: return@withContext null
+                if (parsedDom.schemaVersion != EpubLayoutPackage.CURRENT_SCHEMA_VERSION ||
+                    parsedDom.chapterIndex != chapterIndex || parsedDom.textLength != reference.textLength
+                ) return@withContext null
+                // 旧安装写的是 chapters/ch-N.json 与 legacy-v9/ch-N.json；新安装是 .json.gz 与 legacy 里的 .json。
+                val legacyFile = safeChild(root, "$LEGACY_CHAPTER_DIRECTORY/${chapterFile.name.removeSuffix(".gz")}")
+                val legacy = legacyFile?.takeIf(File::isFile)?.let { file ->
+                    runCatching { json.decodeFromString(EpubLayoutChapter.serializer(), GzipTextFiles.readText(file)) }.getOrNull()
+                } ?: EpubLayoutChapter(
+                    chapterIndex = chapterIndex,
+                    href = parsedDom.href,
+                    textLength = parsedDom.textLength
+                )
+                legacy to parsedDom
+            } else {
+                val legacy = runCatching {
+                    json.decodeFromString(EpubLayoutChapter.serializer(), GzipTextFiles.readText(chapterFile))
+                }.getOrNull() ?: return@withContext null
+                if (legacy.chapterIndex != chapterIndex || legacy.textLength != reference.textLength) {
+                    return@withContext null
+                }
+                legacy to EpubV9DomAdapter.adapt(legacy)
+            }
+            val paths = buildMap {
+                layoutPackage.resources.forEach { resource ->
+                    val resourceRoot = File(root, RESOURCE_DIRECTORY)
+                    val portableFile = File(resourceRoot, resourceFileName(resource.archivePath))
+                    val file = portableFile.takeIf(File::isFile)
+                        ?: runCatching { safeChild(resourceRoot, resource.archivePath) }.getOrNull()
+                    val path = if (archive != null && resource.kind in setOf(EpubLayoutResourceKind.IMAGE, EpubLayoutResourceKind.SVG)) {
+                        EpubArchiveAsset(archive, resource.archivePath).encode()
+                    } else file?.takeIf(File::isFile)?.absolutePath ?: return@forEach
+                    EpubResourcePath.packageAliases(resource.href, layoutPackage.packageDocumentPath)
+                        .forEach { alias -> putIfAbsent(alias, path) }
+                    EpubResourcePath.packageAliases(resource.archivePath, layoutPackage.packageDocumentPath)
+                        .forEach { alias -> putIfAbsent(alias, path) }
+                }
+            }
+            val fontFaces = layoutPackage.fontFaces.mapNotNull { face ->
+                paths[face.resourceHref]?.let { path ->
+                    EpubResolvedFontFace(
+                        family = face.family,
+                        filePath = path,
+                        weight = face.weight,
+                        italic = face.italic
+                    )
+                }
+            }
+            val fonts = fontFaces
+                .groupBy { it.family.lowercase() }
+                .mapValues { (_, faces) ->
+                    faces.minBy { face ->
+                        kotlin.math.abs((face.weight ?: 400) - 400) + if (face.italic) 1000 else 0
+                    }.filePath
+                }
+            EpubLayoutChapterBundle(
+                document = chapter,
+                resourcePaths = paths,
+                fontPaths = fonts,
+                fontFaces = fontFaces,
+                dom = dom,
+                stylesheets = layoutPackage.stylesheets
+            )
+        }
+
+    suspend fun hasCurrentLayout(bookId: Long, expectedTextLengths: List<Int>): Boolean =
+        withContext(Dispatchers.IO) {
+            if (expectedTextLengths.isEmpty()) return@withContext false
+            val index = runCatching { readPackage(bookId) }.getOrNull()
+                ?: return@withContext false
+            if (index.schemaVersion != EpubLayoutPackage.CURRENT_SCHEMA_VERSION ||
+                (index.sourceArchive == null && index.parserRevision != EpubLayoutPackage.CURRENT_PARSER_REVISION) ||
+                index.chapters.size != expectedTextLengths.size
+            ) {
+                return@withContext false
+            }
+            val references = index.chapters.associateBy(EpubLayoutChapterRef::chapterIndex)
+            if (references.size != expectedTextLengths.size) return@withContext false
+            expectedTextLengths.indices.all { chapterIndex ->
+                val reference = references[chapterIndex] ?: return@all false
+                if (reference.textLength != expectedTextLengths[chapterIndex]) return@all false
+                if (index.sourceArchive != null) return@all resolveArchivePath(context.filesDir, index.sourceArchive) != null
+                val root = directory(bookId)
+                val chapterFile = safeChild(root, reference.fileName) ?: return@all false
+                // The index is written atomically after every chapter file. Deserializing hundreds
+                // of large AST JSON files here made app startup repair and reader entry almost as
+                // expensive as importing the book again. Validate the cheap index/file contract;
+                // readChapter() still performs full schema and coordinate validation on demand.
+                chapterFile.isFile && chapterFile.length() > 0L
+            }
+        }
+
+    /**
+     * Compress in place with an atomic file replacement, preserving every indexed path. Readers
+     * can use either version by gzip magic; interruption never exposes a missing chapter/index.
+     * Write the completion marker only after every chapter and legacy sidecar has succeeded.
+     */
+    suspend fun compact(bookId: Long): Boolean = withContext(Dispatchers.IO) {
+        val root = directory(bookId)
+        val marker = File(root, COMPACT_MARKER)
+        if (!root.isDirectory || marker.isFile) return@withContext false
+        val layoutPackage = readPackage(bookId) ?: return@withContext false
+        if (layoutPackage.sourceArchive != null) { archiveCache.trim(bookId); return@withContext false }
+        if (layoutPackage.schemaVersion != EpubLayoutPackage.CURRENT_SCHEMA_VERSION) return@withContext false
+        val keepLegacyBlocks = layoutPackage.stylesheets.isEmpty()
+        var changed = false
+        var complete = true
+        for (ref in layoutPackage.chapters) {
+            currentCoroutineContext().ensureActive()
+            val chapterFile = safeChild(root, ref.fileName)?.takeIf(File::isFile)
+            if (chapterFile == null) {
+                complete = false
+                continue
+            }
+            val result = runCatching {
+                val chapterText = GzipTextFiles.readText(chapterFile)
+                val dom = json.decodeFromString(EpubDomChapter.serializer(), chapterText)
+                require(dom.schemaVersion == EpubLayoutPackage.CURRENT_SCHEMA_VERSION &&
+                    dom.chapterIndex == ref.chapterIndex && dom.textLength == ref.textLength) {
+                    "EPUB DOM 与布局索引不一致：${ref.chapterIndex}"
+                }
+                if (!GzipTextFiles.isGzip(chapterFile)) {
+                    GzipTextFiles.replaceWithGzip(chapterFile, chapterText)
+                    changed = true
+                }
+                val plainName = chapterFile.name.removeSuffix(".gz")
+                val legacyFile = safeChild(root, "$LEGACY_CHAPTER_DIRECTORY/$plainName")
+                if (!keepLegacyBlocks && legacyFile?.isFile == true) {
+                    val legacy = json.decodeFromString(EpubLayoutChapter.serializer(), GzipTextFiles.readText(legacyFile))
+                    if (legacy.blocks.isNotEmpty()) {
+                        GzipTextFiles.replaceWithGzip(legacyFile, json.encodeToString(legacy.copy(blocks = emptyList())))
+                        changed = true
+                    }
+                }
+            }
+            if (result.isFailure) complete = false
+        }
+        if (complete) marker.writeText("v2")
+        changed
+    }
+
+    fun delete(bookId: Long) {
+        directory(bookId).deleteRecursively()
+        archiveCache.delete(bookId)
+        synchronized(packageCache) { packageCache.remove(bookId) }
+    }
+
+    private fun readPackage(bookId: Long): EpubLayoutPackage? =
+        synchronized(packageCache) { packageCache[bookId] } ?: readPackageBlocking(bookId)?.also { value ->
+            synchronized(packageCache) { packageCache[bookId] = value }
+        }
+
+    private fun readPackageBlocking(bookId: Long): EpubLayoutPackage? {
+        val file = File(directory(bookId), INDEX_FILE).takeIf(File::isFile) ?: return null
+        return runCatching { json.decodeFromString(EpubLayoutPackage.serializer(), file.readText()) }.getOrNull()
+    }
+
+    private fun extractResources(
+        epubFile: File,
+        layoutPackage: EpubLayoutPackage,
+        targetRoot: File,
+        chapterStyles: List<EpubStylesheetText>,
+        fontsOnly: Boolean = false
+    ) {
+        targetRoot.mkdirs()
+        val referencedBackgrounds = buildSet {
+            (layoutPackage.stylesheets + chapterStyles).forEach { stylesheet ->
+                CssTokenizer.tokenize(stylesheet.css)
+                    .filter { it.type == CssTokenType.URL }
+                    .mapNotNull { token -> EpubResourcePath.normalize(token.text, stylesheet.href) }
+                    .forEach { add(it.lowercase()) }
+            }
+        }
+        fun EpubLayoutResource.isNeededAtRenderTime(): Boolean {
+            if (kind == EpubLayoutResourceKind.FONT) return true
+            if (fontsOnly) return false
+            if (referencedBackgrounds.isEmpty()) return false
+            return EpubResourcePath.packageAliases(href, layoutPackage.packageDocumentPath)
+                .any { it.lowercase() in referencedBackgrounds } ||
+                EpubResourcePath.packageAliases(archivePath, layoutPackage.packageDocumentPath)
+                    .any { it.lowercase() in referencedBackgrounds }
+        }
+        ZipFile(epubFile).use { zip ->
+            val entries = zip.entries().asSequence().filterNot(ZipEntry::isDirectory)
+                .associateBy { normalizeArchivePath(it.name).lowercase() }
+            // XHTML/CSS/nav have already been compiled into chapter JSON. Inline images live in
+            // BookMediaStore. Keeping only fonts and actual CSS background assets avoids a second
+            // full EPUB extraction (and duplicate copies of every illustration) during import.
+            layoutPackage.resources.asSequence()
+                .filter { it.isNeededAtRenderTime() }
+                .forEach { resource ->
+                    val entry = entries[resource.archivePath.lowercase()] ?: return@forEach
+                    if (entry.size > MAX_EXTRACTED_RESOURCE_BYTES) return@forEach
+                    // ZIP names are URLs, not platform filenames. A stable local name also
+                    // supports reserved characters and very long names without duplicating data.
+                    val output = File(targetRoot, resourceFileName(resource.archivePath))
+                    output.parentFile?.mkdirs()
+                    val digest = resource.sha256?.let { MessageDigest.getInstance("SHA-256") }
+                    var copied = 0L
+                    zip.getInputStream(entry).buffered().use { input ->
+                        output.outputStream().buffered().use { stream ->
+                            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                            while (true) {
+                                val count = input.read(buffer)
+                                if (count < 0) break
+                                copied += count
+                                require(copied <= MAX_EXTRACTED_RESOURCE_BYTES) { "EPUB 资源过大" }
+                                digest?.update(buffer, 0, count)
+                                stream.write(buffer, 0, count)
+                            }
+                        }
+                    }
+                    val actualHash = digest?.digest()?.joinToString("") { "%02x".format(it) }
+                    if (resource.sha256 != null && actualHash != resource.sha256) {
+                        output.delete()
+                        error("EPUB 资源校验失败：${resource.href}")
+                    }
+                }
+        }
+    }
+
+    private fun directory(bookId: Long): File = File(context.filesDir, "$ROOT_DIRECTORY/$bookId")
+
+    private fun safeChild(root: File, relativePath: String): File? {
+        val child = File(root, relativePath).canonicalFile
+        return child.takeIf { it.toPath().startsWith(root.canonicalFile.toPath()) }
+    }
+
+    private fun normalizeArchivePath(path: String): String = path.replace('\\', '/').removePrefix("./")
+
+    private fun resourceFileName(archivePath: String): String {
+        val hash = MessageDigest.getInstance("SHA-256").digest(archivePath.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+        val extension = archivePath.substringAfterLast('.', "")
+            .lowercase().takeIf { it.length in 1..10 && it.all(Char::isLetterOrDigit) } ?: "bin"
+        return "$hash.$extension"
+    }
+
+    companion object {
+        const val ROOT_DIRECTORY = "book-layout"
+        /** 压实完成标记；存在即跳过，避免每次启动都重读全部章节文件。 */
+        const val COMPACT_MARKER = ".compacted-v2"
+        private const val ARCHIVE_STORAGE_MARKER = ".archive-v1"
+        const val INDEX_FILE = "index.json"
+        const val CHAPTER_DIRECTORY = "chapters"
+        const val LEGACY_CHAPTER_DIRECTORY = "legacy-v9"
+        const val RESOURCE_DIRECTORY = "resources"
+        const val MAX_EXTRACTED_RESOURCE_BYTES = 64L * 1024 * 1024
+        private const val PACKAGE_CACHE_SIZE = 4
+        private val json = Json { ignoreUnknownKeys = true }
+    }
+}

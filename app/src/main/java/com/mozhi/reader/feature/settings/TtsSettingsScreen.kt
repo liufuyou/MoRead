@@ -1,0 +1,570 @@
+package com.mozhi.reader.feature.settings
+
+import com.mozhi.reader.ui.components.committedDraft
+import com.mozhi.reader.ui.components.rememberCommittedTextFieldState
+import com.mozhi.reader.ui.components.rememberCommittedDrafts
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.outlined.PlayArrow
+import androidx.compose.material.icons.outlined.RestartAlt
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Button
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.mozhi.reader.core.speech.TtsApiProvider
+import com.mozhi.reader.R
+import com.mozhi.reader.core.speech.TtsEngineMode
+import com.mozhi.reader.ui.components.MoReadBackdrop
+import com.mozhi.reader.ui.components.TtsTuningActions
+import com.mozhi.reader.ui.components.TtsTuningSections
+import com.mozhi.reader.ui.components.MoReadRow
+import com.mozhi.reader.ui.components.VoiceChoiceDialog
+import com.mozhi.reader.ui.components.VoiceChoice
+import com.mozhi.reader.ui.components.GeminiVoicePicker
+import java.util.Locale
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+
+/**
+ * 独立「语音朗读」设置页：SegmentedButton 切换系统 TTS / AI TTS，
+ * 各引擎的参数表单化（不再手写 extraJson），可即时试听。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun TtsSettingsScreen(
+    onBack: () -> Unit,
+    onOpenSpeechCache: () -> Unit = {},
+    onOpenVoiceLibrary: () -> Unit = {},
+    viewModel: TtsSettingsViewModel = hiltViewModel()
+) {
+    val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val settings = state.settings
+    val drafts = rememberCommittedDrafts()
+    val focusManager = LocalFocusManager.current
+    // Secret drafts stay in memory and are encrypted before switching or leaving the page.
+    var apiKeyInput by remember { mutableStateOf("") }
+    var showResetConfirm by remember { mutableStateOf(false) }
+    val systemLanguageTagDraft = rememberCommittedTextFieldState(drafts, "systemLanguageTag", settings.systemLanguageTag,
+        trim = true, onCommit = viewModel::setSystemLanguage)
+    val aiBaseUrlDraft = rememberCommittedTextFieldState(drafts, "aiBaseUrl", settings.aiBaseUrl,
+        trim = true, onCommit = viewModel::setAiBaseUrl)
+    val aiGroupIdDraft = rememberCommittedTextFieldState(drafts, "aiGroupId", settings.aiGroupId,
+        trim = true, onCommit = viewModel::setAiGroupId)
+    val aiModelDraft = rememberCommittedTextFieldState(drafts, "aiModel", settings.aiModel,
+        trim = true, onCommit = viewModel::setAiModel)
+    val aiVoiceIdDraft = rememberCommittedTextFieldState(drafts, "aiVoiceId", settings.aiVoiceId,
+        trim = true, onCommit = viewModel::setAiVoice)
+    val saveGate = rememberDraftSaveGate(drafts, viewModel::flushPendingWrites, viewModel::discardFailedWrites)
+    fun commitKey() {
+        if (apiKeyInput.isNotBlank()) {
+            viewModel.saveApiKey(apiKeyInput)
+            apiKeyInput = ""
+        }
+    }
+    fun afterDrafts(action: () -> Unit) { commitKey(); saveGate.run(action = action) }
+    fun leaveAfterDrafts(action: () -> Unit) { commitKey(); saveGate.run(navigation = true, action = action) }
+    BackHandler { leaveAfterDrafts(onBack) }
+    DraftSaveDialogs(saveGate)
+
+    MoReadBackdrop {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = { leaveAfterDrafts(onBack) }) {
+                    Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = "返回")
+                }
+                Text(
+                    "语音朗读",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = { leaveAfterDrafts(onOpenVoiceLibrary) }) { Text("音色库") }
+                TextButton(onClick = { leaveAfterDrafts(onOpenSpeechCache) }) { Text("缓存") }
+            }
+
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .imePadding()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 20.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                    SegmentedButton(
+                        selected = settings.engineMode == TtsEngineMode.SYSTEM,
+                        onClick = { afterDrafts { viewModel.setEngineMode(TtsEngineMode.SYSTEM) } },
+                        shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2)
+                    ) { Text("系统 TTS") }
+                    SegmentedButton(
+                        selected = settings.engineMode == TtsEngineMode.AI,
+                        onClick = { afterDrafts { viewModel.setEngineMode(TtsEngineMode.AI) } },
+                        shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2)
+                    ) { Text("AI TTS") }
+                }
+
+                if (settings.engineMode == TtsEngineMode.SYSTEM) {
+                    Text(
+                        "使用 MultiTTS 等已安装引擎；音色是否联网由引擎决定。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    var engineMenuExpanded by remember { mutableStateOf(false) }
+                    val engineLabel = state.systemEngines
+                        .firstOrNull { it.packageName == settings.systemEnginePackage }
+                        ?.label
+                        ?: if (settings.systemEnginePackage.isBlank()) "系统默认引擎" else settings.systemEnginePackage
+                    ExposedDropdownMenuBox(
+                        expanded = engineMenuExpanded,
+                        onExpandedChange = { engineMenuExpanded = it }
+                    ) {
+                        OutlinedTextField(
+                            value = engineLabel,
+                            onValueChange = {},
+                            readOnly = true,
+                            label = { Text("语音引擎") },
+                            trailingIcon = {
+                                ExposedDropdownMenuDefaults.TrailingIcon(expanded = engineMenuExpanded)
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .menuAnchor()
+                        )
+                        ExposedDropdownMenu(
+                            expanded = engineMenuExpanded,
+                            onDismissRequest = { engineMenuExpanded = false }
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("系统默认引擎") },
+                                onClick = {
+                                    engineMenuExpanded = false
+                                    viewModel.setSystemEngine("")
+                                }
+                            )
+                            state.systemEngines.forEach { engine ->
+                                DropdownMenuItem(
+                                    text = { Text(engine.label) },
+                                    onClick = {
+                                        engineMenuExpanded = false
+                                        viewModel.setSystemEngine(engine.packageName)
+                                    }
+                                )
+                            }
+                        }
+                    }
+                    var showVoices by remember { mutableStateOf(false) }
+                    MoReadRow(
+                        title = "朗读音色",
+                        subtitle = settings.systemVoiceName.ifBlank { "跟随引擎默认" },
+                        onClick = { showVoices = true }
+                    )
+                    Button(onClick = viewModel::refreshSystemVoices, enabled = !state.loadingVoices) {
+                        Text(if (state.loadingVoices) "正在读取音色…" else "刷新本地音色")
+                    }
+                    if (showVoices) VoiceChoiceDialog(
+                        title = "选择本地音色",
+                        choices = listOf(VoiceChoice("", "跟随引擎默认")) + state.systemVoices.map {
+                            VoiceChoice(it.name, it.name, it.description)
+                        },
+                        selectedId = settings.systemVoiceName,
+                        onSelect = { viewModel.setSystemVoice(it); showVoices = false },
+                        onDismiss = { showVoices = false }
+                    )
+                    OutlinedTextField(
+                        value = systemLanguageTagDraft.value,
+                        onValueChange = systemLanguageTagDraft::edit,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text, imeAction = ImeAction.Done),
+                        keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus() }),
+                        label = { Text("语言标签（可选）") },
+                        supportingText = { Text("BCP-47，如 zh-CN；留空用引擎默认语言") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth().committedDraft(systemLanguageTagDraft)
+                    )
+                    LabeledSlider(
+                        label = "语速",
+                        value = settings.systemRate,
+                        range = 0.5f..2.5f,
+                        onChange = viewModel::setSystemRate
+                    )
+                    LabeledSlider(
+                        label = "音调",
+                        value = settings.systemPitch,
+                        range = 0.5f..2f,
+                        onChange = viewModel::setSystemPitch
+                    )
+                } else {
+                    Text(
+                        "各服务商配置分别保存。云端语音按用量计费，API Key 加密保存在本机。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    var apiProviderMenuExpanded by remember { mutableStateOf(false) }
+                    ExposedDropdownMenuBox(
+                        expanded = apiProviderMenuExpanded,
+                        onExpandedChange = { apiProviderMenuExpanded = it }
+                    ) {
+                        OutlinedTextField(
+                            value = settings.aiProvider.label(),
+                            onValueChange = {},
+                            readOnly = true,
+                            label = { Text("服务商") },
+                            trailingIcon = {
+                                ExposedDropdownMenuDefaults.TrailingIcon(
+                                    expanded = apiProviderMenuExpanded
+                                )
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .menuAnchor()
+                        )
+                        ExposedDropdownMenu(
+                            expanded = apiProviderMenuExpanded,
+                            onDismissRequest = { apiProviderMenuExpanded = false }
+                        ) {
+                            TtsApiProvider.entries.forEach { provider ->
+                                DropdownMenuItem(
+                                    text = { Text(provider.label()) },
+                                    onClick = {
+                                        apiProviderMenuExpanded = false
+                                        afterDrafts { drafts.acceptExternalChanges(); viewModel.setAiProvider(provider) }
+                                    }
+                                )
+                            }
+                        }
+                    }
+                    OutlinedTextField(
+                        value = aiBaseUrlDraft.value,
+                        onValueChange = aiBaseUrlDraft::edit,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Done),
+                        keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus() }),
+                        label = { Text("Base URL") },
+                        supportingText = {
+                            Text(
+                                when (settings.aiProvider) {
+                                    TtsApiProvider.MINIMAX_CN -> "MiniMax 国内：https://api.minimaxi.com/v1"
+                                    TtsApiProvider.MINIMAX_INTL -> "MiniMax 海外：https://api.minimax.io/v1"
+                                    TtsApiProvider.OPENAI_COMPAT -> "OpenAI 官方或任意兼容中转"
+                                    TtsApiProvider.GMI_CLOUD -> "GMI Cloud，或兼容其 Request Queue 协议的地址"
+                                    TtsApiProvider.GEMINI -> "Google 官方地址，也可填写兼容 Gemini 原生协议的地址"
+                                    TtsApiProvider.XIAOMI_MIMO -> stringResource(R.string.tts_mimo_base_url_hint)
+                                    TtsApiProvider.FISH_AUDIO -> stringResource(R.string.tts_fish_base_url_hint)
+                                }
+                            )
+                        },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth().committedDraft(aiBaseUrlDraft)
+                    )
+                    OutlinedTextField(
+                        value = apiKeyInput,
+                        onValueChange = { apiKeyInput = it },
+                        label = { Text("API Key") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        supportingText = {
+                            Text(if (state.hasApiKey) "当前服务商已保存，重新输入可覆盖" else "当前服务商尚未保存")
+                        },
+                        singleLine = true,
+                        trailingIcon = {
+                            TextButton(
+                                onClick = {
+                                    afterDrafts {}
+                                },
+                                enabled = apiKeyInput.isNotBlank()
+                            ) { Text("保存") }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    if (
+                        settings.aiProvider == TtsApiProvider.MINIMAX_CN ||
+                        settings.aiProvider == TtsApiProvider.MINIMAX_INTL
+                    ) {
+                        OutlinedTextField(
+                            value = aiGroupIdDraft.value,
+                            onValueChange = aiGroupIdDraft::edit,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text, imeAction = ImeAction.Done),
+                            keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus() }),
+                            label = { Text("GroupId（可选）") },
+                            supportingText = { Text("MiniMax 控制台的 GroupId；部分账号必填") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth().committedDraft(aiGroupIdDraft)
+                        )
+                    }
+                    OutlinedTextField(
+                        value = aiModelDraft.value,
+                        onValueChange = aiModelDraft::edit,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text, imeAction = ImeAction.Done),
+                        keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus() }),
+                        label = { Text("模型") },
+                        supportingText = {
+                            Text(
+                                when (settings.aiProvider) {
+                                    TtsApiProvider.OPENAI_COMPAT -> "如 gpt-4o-mini-tts / tts-1"
+                                    TtsApiProvider.GMI_CLOUD -> "如 minimax-tts-speech-2.8-hd"
+                                    TtsApiProvider.GEMINI -> "gemini-3.8-flash-tts；更快可用 gemini-3.8-flash-lite-tts"
+                                    TtsApiProvider.XIAOMI_MIMO -> stringResource(R.string.tts_mimo_model_hint)
+                                    TtsApiProvider.FISH_AUDIO -> stringResource(R.string.tts_fish_model_hint)
+                                    else -> if ("turbo" in settings.aiModel.lowercase()) {
+                                        "Turbo 更偏速度；有声书表演推荐 speech-2.8-hd"
+                                    } else {
+                                        "有声书推荐 speech-2.8-hd；低延迟可用 speech-2.8-turbo"
+                                    }
+                                }
+                            )
+                        },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth().committedDraft(aiModelDraft)
+                    )
+                    if (settings.aiIsGemini) {
+                        var chooseGeminiVoice by remember { mutableStateOf(false) }
+                        MoReadRow(
+                            title = "朗读音色",
+                            subtitle = settings.aiVoiceId.ifBlank { "Sulafat · 温暖" },
+                            onClick = { afterDrafts { chooseGeminiVoice = true } }
+                        )
+                        if (chooseGeminiVoice) GeminiVoicePicker(settings.aiVoiceId, { voice ->
+                            chooseGeminiVoice = false
+                            afterDrafts { drafts.acceptExternalChanges(); viewModel.setAiVoice(voice) }
+                        }, { chooseGeminiVoice = false })
+                    }
+                    OutlinedTextField(
+                        value = aiVoiceIdDraft.value,
+                        onValueChange = aiVoiceIdDraft::edit,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text, imeAction = ImeAction.Done),
+                        keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus() }),
+                        label = { Text("音色 ID（可选）") },
+                        supportingText = {
+                            Text(when {
+                                settings.aiIsGemini -> "也可填写音色库或自定义 voice_… ID；留空使用 Sulafat"
+                                settings.aiIsMimo -> stringResource(R.string.tts_mimo_voice_hint)
+                                settings.aiIsFish -> stringResource(R.string.tts_fish_voice_hint)
+                                else -> "OpenAI 如 alloy / nova；MiniMax 与 GMI 可填系统或克隆音色 ID"
+                            })
+                        },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth().committedDraft(aiVoiceIdDraft)
+                    )
+                    LabeledSlider(
+                        label = "语速",
+                        value = settings.aiSpeed,
+                        range = 0.5f..2f,
+                        onChange = viewModel::setAiSpeed
+                    )
+                    if (settings.aiSupportsVolume) LabeledSlider(
+                        label = if (settings.aiUsesStyleControls) "音量风格" else "音量",
+                        value = settings.aiVolume,
+                        range = 0.5f..2f,
+                        onChange = viewModel::setAiVolume
+                    )
+                    if (settings.aiSupportsPitch) Column {
+                        Text(
+                            (if (settings.aiUsesStyleControls) "音调风格：" else "音调：") + settings.aiPitch,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Slider(
+                            value = settings.aiPitch.toFloat(),
+                            onValueChange = { viewModel.setAiPitch(it.toInt()) },
+                            valueRange = -12f..12f,
+                            steps = 23
+                        )
+                    }
+                    Text(
+                        if (settings.aiUsesStyleControls) {
+                            "语速、音量与音调通过风格指令引导，实际效果以试听为准。"
+                        } else if (settings.aiProvider == TtsApiProvider.GMI_CLOUD) {
+                            "GMI 请求会自动等待任务完成并下载音频，默认情绪为 auto。"
+                        } else if (settings.aiIsFish) {
+                            stringResource(R.string.tts_fish_controls_hint)
+                        } else if (settings.aiIsMiniMax) {
+                            stringResource(R.string.tts_minimax_controls_hint)
+                        } else {
+                            "OpenAI 不支持音量与音调。"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
+                TtsTuningSections(
+                    settings = settings,
+                    includeEngineSection = false,
+                    includeRateControls = false,
+                    actions = TtsTuningActions(
+                        onEngineModeChange = { mode -> afterDrafts { viewModel.setEngineMode(mode) } },
+                        onAiVoiceChange = { voice -> afterDrafts { drafts.acceptExternalChanges(); viewModel.setAiVoice(voice) } },
+                        onSystemRateChange = viewModel::setSystemRate,
+                        onSystemPitchChange = viewModel::setSystemPitch,
+                        onAiSpeedChange = viewModel::setAiSpeed,
+                        onAiVolumeChange = viewModel::setAiVolume,
+                        onAiPitchChange = viewModel::setAiPitch,
+                        onAllowAudioMixingChange = viewModel::setAllowAudioMixing,
+                        onTrimSilenceChange = viewModel::setTrimSilence,
+                        onGranularityChange = viewModel::setSynthesisGranularity,
+                        onMaxCharsChange = viewModel::setMaxSynthesisChars,
+                        onConcurrencyChange = viewModel::setSynthesisConcurrency,
+                        onRetryCountChange = viewModel::setRetryCount,
+                        onPrefetchCountChange = viewModel::setPrefetchCount,
+                        onOpenVoiceLibrary = { leaveAfterDrafts(onOpenVoiceLibrary) }
+                    )
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Button(
+                        onClick = { afterDrafts(viewModel::preview) },
+                        enabled = !state.isPreviewing,
+                        contentPadding = PaddingValues(horizontal = 8.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Icon(
+                            Icons.Outlined.PlayArrow,
+                            contentDescription = null,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Text(
+                            if (state.isPreviewing) "正在试听…" else "试听",
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.labelLarge,
+                            modifier = Modifier.padding(start = 6.dp)
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = { showResetConfirm = true },
+                        contentPadding = PaddingValues(horizontal = 8.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Icon(
+                            Icons.Outlined.RestartAlt,
+                            contentDescription = null,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Text(
+                            "恢复默认参数",
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.labelLarge,
+                            modifier = Modifier.padding(start = 6.dp)
+                        )
+                    }
+                }
+
+                state.message?.let { message ->
+                    Text(
+                        message,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+    }
+
+    if (showResetConfirm) {
+        AlertDialog(
+            onDismissRequest = { showResetConfirm = false },
+            title = { Text("恢复默认参数？") },
+            text = {
+                Text("语速、音量、音调、合成粒度与各项数量将恢复默认值；引擎、服务商、密钥与音色保持不变。")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showResetConfirm = false
+                        afterDrafts(viewModel::restoreDefaultTuning)
+                    }
+                ) { Text("恢复") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showResetConfirm = false }) { Text("取消") }
+            }
+        )
+    }
+}
+
+@Composable
+private fun LabeledSlider(
+    label: String,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    onChange: (Float) -> Unit
+) {
+    Column {
+        Text(
+            "$label：${String.format(Locale.ROOT, "%.2f", value)}×",
+            style = MaterialTheme.typography.bodySmall
+        )
+        Slider(value = value, onValueChange = onChange, valueRange = range)
+    }
+}
+
+@Composable
+private fun TtsApiProvider.label(): String = when (this) {
+    TtsApiProvider.MINIMAX_CN -> "MiniMax（国内）"
+    TtsApiProvider.MINIMAX_INTL -> "MiniMax（海外）"
+    TtsApiProvider.OPENAI_COMPAT -> "OpenAI 兼容"
+    TtsApiProvider.GMI_CLOUD -> "GMI Cloud（自定义 TTS）"
+    TtsApiProvider.GEMINI -> "Gemini TTS"
+    TtsApiProvider.XIAOMI_MIMO -> stringResource(R.string.tts_provider_mimo)
+    TtsApiProvider.FISH_AUDIO -> stringResource(R.string.tts_provider_fish)
+}

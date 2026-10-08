@@ -1,0 +1,202 @@
+{
+    "fixture": "06-dialog-cards",
+    "bodyLength": 94,
+    "pages": [
+        {
+            "index": 0,
+            "chapterPosition": 0,
+            "charLength": 90,
+            "height": 235.60002,
+            "backgroundColorArgb": null,
+            "backgroundImagePath": null,
+            "immersive": false,
+            "hideHeader": false,
+            "decorations": [
+                {
+                    "kind": "block",
+                    "left": 14.0,
+                    "top": 40.800003,
+                    "right": 226.0,
+                    "bottom": 123.20001,
+                    "backgroundColorArgb": 1207959551,
+                    "backgroundImagePath": null,
+                    "backgroundSizeMode": "AUTO",
+                    "backgroundSize": [
+                        0.0,
+                        0.0
+                    ],
+                    "backgroundRepeat": [
+                        true,
+                        true
+                    ],
+                    "backgroundPosition": [
+                        0.5,
+                        0.5
+                    ],
+                    "borderWidths": [
+                        1.25,
+                        1.25,
+                        1.25,
+                        1.25
+                    ],
+                    "borderColors": [
+                        -16777216,
+                        -16777216,
+                        -16777216,
+                        -16777216
+                    ],
+                    "radii": [
+                        7.5,
+                        7.5,
+                        7.5,
+                        7.5
+                    ],
+                    "shadowCount": 0,
+                    "edges": [
+                        true,
+                        true,
+                        true,
+                        true
+                    ]
+                },
+                {
+                    "kind": "block",
+                    "left": 14.0,
+                    "top": 143.20001,
+                    "right": 226.0,
+                    "bottom": 246.40002,
+                    "backgroundColorArgb": 1207959551,
+                    "backgroundImagePath": null,
+                    "backgroundSizeMode": "AUTO",
+                    "backgroundSize": [
+                        0.0,
+                        0.0
+                    ],
+                    "backgroundRepeat": [
+                        true,
+                        true
+                    ],
+                    "backgroundPosition": [
+                        0.5,
+                        0.5
+                    ],
+                    "borderWidths": [
+                        1.25,
+                        1.25,
+                        1.25,
+                        1.25
+                    ],
+                    "borderColors": [
+                        -16777216,
+                        -16777216,
+                        -16777216,
+                        -16777216
+                    ],
+                    "radii": [
+                        7.5,
+                        7.5,
+                        7.5,
+                        7.5
+                    ],
+                    "shadowCount": 0,
+                    "edges": [
+                        true,
+                        true,
+                        true,
+                        true
+                    ]
+                }
+            ],
+            "lines": [
+                {
+                    "chapterPosition": 0,
+                    "charLength": 23,
+                    "lineTop": 0.0,
+                    "lineBottom": 20.0,
+                    "startX": 0.0,
+                    "image": null,
+                    "images": [],
+                    "glyphImages": [],
+                    "decorations": []
+                },
+                {
+                    "chapterPosition": 24,
+                    "charLength": 15,
+                    "lineTop": 50.800003,
+                    "lineBottom": 70.8,
+                    "startX": 44.0,
+                    "image": null,
+                    "images": [],
+                    "glyphImages": [],
+                    "decorations": []
+                },
+                {
+                    "chapterPosition": 40,
+                    "charLength": 15,
+                    "lineTop": 71.600006,
+                    "lineBottom": 91.600006,
+                    "startX": 44.0,
+                    "image": null,
+                    "images": [],
+                    "glyphImages": [],
+                    "decorations": []
+                },
+                {
+                    "chapterPosition": 55,
+                    "charLength": 2,
+                    "lineTop": 92.40001,
+                    "lineBottom": 112.40001,
+                    "startX": 44.0,
+                    "image": null,
+                    "images": [],
+                    "glyphImages": [],
+                    "decorations": []
+                },
+                {
+                    "chapterPosition": 58,
+                    "charLength": 14,
+                    "lineTop": 153.20001,
+                    "lineBottom": 173.20001,
+                    "startX": 44.0,
+                    "image": null,
+                    "images": [],
+                    "glyphImages": [],
+                    "decorations": []
+                },
+                {
+                    "chapterPosition": 72,
+                    "charLength": 2,
+                    "lineTop": 174.00002,
+                    "lineBottom": 194.00002,
+                    "startX": 44.0,
+                    "image": null,
+                    "images": [],
+                    "glyphImages": [],
+                    "decorations": []
+                },
+                {
+                    "chapterPosition": 75,
+                    "charLength": 15,
+                    "lineTop": 194.80002,
+                    "lineBottom": 214.80002,
+                    "startX": 44.0,
+                    "image": null,
+                    "images": [],
+                    "glyphImages": [],
+                    "decorations": []
+                },
+                {
+                    "chapterPosition": 90,
+                    "charLength": 4,
+                    "lineTop": 215.60002,
+                    "lineBottom": 235.60002,
+                    "startX": 44.0,
+                    "image": null,
+                    "images": [],
+                    "glyphImages": [],
+                    "decorations": []
+                }
+            ]
+        }
+    ]
+}

@@ -1,0 +1,1590 @@
+package com.mozhi.reader.core.datastore
+
+import android.os.Build
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.floatPreferencesKey
+import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
+import com.mozhi.reader.ui.theme.AccentPreset
+import com.mozhi.reader.ui.theme.AppearanceSettings
+import com.mozhi.reader.ui.theme.ColorSchemePreset
+import com.mozhi.reader.ui.theme.NavStyle
+import com.mozhi.reader.ui.theme.SemanticHarmony
+import com.mozhi.reader.ui.theme.ShapeStyle
+import com.mozhi.reader.ui.theme.SurfaceStyle
+import com.mozhi.reader.ui.theme.ThemeMode
+import com.mozhi.reader.ui.theme.availableOn
+import javax.inject.Inject
+import javax.inject.Singleton
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
+
+enum class ReaderTheme {
+    SYSTEM,
+    LIGHT,
+    DARK,
+    PAPER,
+    EYE_CARE,
+    /** Pure-black OLED theme, 深空. */
+    AMOLED,
+    /** Pale celadon, 青简. */
+    MIST
+}
+
+enum class WidePageLayout { SINGLE, DUAL }
+
+enum class PageMode {
+    PAGINATED,
+    SCROLL
+}
+
+enum class PageTurnAnimation {
+    SIMULATION,
+    MODERN_SIMULATION,
+    COVER,
+    SLIDE,
+    NONE
+}
+
+enum class ReaderFont {
+    SYSTEM,
+    SERIF,
+    SANS_SERIF,
+    MONOSPACE,
+    CUSTOM
+}
+
+/** EPUB 出版商样式与用户排版的合成策略。 */
+enum class PublisherStyleMode {
+    /** 尽量按原书 CSS 渲染，仅保留阅读器页面安全边距。 */
+    RESPECT,
+    /** 用户字号/行距/段距作为基准，原书比例与装饰继续保留。 */
+    SMART,
+    /** 去掉出版商可替换的字号、行距、间距与色板，统一使用用户排版。 */
+    TAKE_OVER
+}
+
+enum class ShelfLayout {
+    GRID,
+    LIST
+}
+
+/**
+ * 阅读页亮度的「跟随系统」哨兵值。
+ *
+ * 取 -1f 是为了和 `WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE` 对齐——
+ * 写回窗口属性时可以原样赋值，不必在两套语义之间来回换算。
+ */
+const val FOLLOW_SYSTEM_BRIGHTNESS = -1f
+
+data class ReaderSettings(
+    val fontScale: Float = 1f,
+    val font: ReaderFont = ReaderFont.SYSTEM,
+    /** 已导入到应用私有目录的 TTF/OTF 文件。 */
+    val customFontPath: String? = null,
+    /** 从字体 name 表自动识别、且允许用户在导入时改写的显示名。 */
+    val customFontName: String? = null,
+    /** 所有已导入字体；正文与语法规则均通过稳定 id 引用。 */
+    val fontLibrary: List<ReaderFontAsset> = emptyList(),
+    val selectedCustomFontId: String? = null,
+    /** 正文字重；Android Typeface 的常用有效区间为 100..900。 */
+    val fontWeight: Int = 400,
+    val lineHeight: Float = 1.55f,
+    /** EPUB 出版商 CSS 的处理方式，默认智能融合。 */
+    val publisherStyleMode: PublisherStyleMode = PublisherStyleMode.SMART,
+    /** 旧版统一边距；保留用于迁移，运行时请使用四边独立值。 */
+    val pageMargin: Float = 1f,
+    /** 阅读正文左侧边距，0..2 对应紧凑到宽松。 */
+    val pageMarginLeft: Float = 1f,
+    /** 阅读正文右侧边距，0..2 对应紧凑到宽松。 */
+    val pageMarginRight: Float = 1f,
+    /** 阅读正文上侧边距，0..2 对应紧凑到宽松。 */
+    val pageMarginTop: Float = 0f,
+    /** 阅读正文下侧边距，0..2 对应紧凑到宽松。 */
+    val pageMarginBottom: Float = 0f,
+    /** 页眉相对默认位置继续向下偏移，0..2。 */
+    val headerMarginTop: Float = 0f,
+    /** 页脚相对默认位置继续向上偏移，0..2。 */
+    val footerMarginBottom: Float = 0f,
+    /** TextPaint 的 em 字间距。 */
+    val letterSpacingEm: Float = 0f,
+    /** 段后距，以正文字号 em 为单位。 */
+    val paragraphSpacingEm: Float = 0.55f,
+    /** 段首缩进，以全角字符宽度为单位；不向正文注入空格。 */
+    val firstLineIndentEm: Float = 2f,
+    /** 章节标题相对正文字号。 */
+    val titleScale: Float = 1.35f,
+    /** 章节标题上方留白，以正文行高为单位。 */
+    val titleTopSpacing: Float = 0.4f,
+    /** 章节标题与正文之间留白，以正文行高为单位。 */
+    val titleBottomSpacing: Float = 1f,
+    val titleStyle: ReaderTitleStyle = ReaderTitleStyle(),
+    val titleStylePresets: List<ReaderTitleStylePreset> = ReaderTitleStylePresetCodec.defaults,
+    val textJustification: Boolean = true,
+    val showHeader: Boolean = true,
+    val showFooter: Boolean = true,
+    val theme: ReaderTheme = ReaderTheme.SYSTEM,
+    val pageMode: PageMode = PageMode.PAGINATED,
+    val autoRead: AutoReadSettings = AutoReadSettings(),
+    val widePageLayout: WidePageLayout = WidePageLayout.SINGLE,
+    val companionSidePaneEnabled: Boolean = false,
+    val pageTurnAnimation: PageTurnAnimation = PageTurnAnimation.SIMULATION,
+    val modernBackTextOpacity: Float = .18f,
+    val modernCurlRadiusScale: Float = 1f,
+    val shelfLayout: ShelfLayout = ShelfLayout.GRID,
+    val shelfBookOrder: List<Long> = emptyList(),
+    val shelfBookOrderReadAnchor: Long = 0L,
+    val readingOrderAffectsShelf: Boolean = true,
+    val keepScreenOn: Boolean = false,
+    /** 阅读页默认隐藏系统状态栏；离开阅读页时恢复。 */
+    val immersiveReading: Boolean = true,
+    /** 按键翻页总开关；保留原偏好键以兼容已有音量键设置。 */
+    val volumeKeysPageTurn: Boolean = false,
+    val physicalKeyBindings: List<ReaderKeyBinding> = ReaderKeyBindings.DEFAULT,
+    val tapZones: ReaderTapZones? = null,
+    val englishLearningEnabled: Boolean = false,
+    val englishBionicEnabled: Boolean = false,
+    val bilingualBooks: Set<Long> = emptySet(),
+    val wordAnnotationMode: com.mozhi.reader.core.dictionary.WordAnnotationMode = com.mozhi.reader.core.dictionary.WordAnnotationMode.INLINE,
+    val vocabulary: List<com.mozhi.reader.core.dictionary.VocabularyWord> = emptyList(),
+    /**
+     * 阅读页窗口亮度，0..1；[FOLLOW_SYSTEM_BRIGHTNESS] 表示跟随系统。
+     * 只作用于阅读页这一个窗口，不改系统全局亮度，退出阅读页即还原。
+     */
+    val screenBrightness: Float = FOLLOW_SYSTEM_BRIGHTNESS,
+    /** 已导入到应用私有目录的阅读背景图片。 */
+    val backgroundImagePath: String? = null,
+    /** 可供阅读背景、书籍封面等位置复用的图片资产。 */
+    val imageLibrary: List<ReaderImageAsset> = emptyList(),
+    val selectedBackgroundImageId: String? = null,
+    /** 背景图片在主题底色之上的不透明度。 */
+    val backgroundImageOpacity: Float = 0.28f,
+    val syntaxHighlightEnabled: Boolean = false,
+    val syntaxHighlightRules: List<ReaderSyntaxRule> = ReaderSyntaxHighlighter.DEFAULT_RULES,
+    /** 正文清洗/替换规则；规则本身可复用，应用范围由阅读页工具决定。 */
+    val textReplacementRules: List<ReaderTextReplacementRule> = emptyList(),
+    /** 用户保存的自定义主题预设。 */
+    val customThemes: List<CustomReaderTheme> = emptyList(),
+    val builtinThemeTypography: Map<String, CustomReaderTheme> = emptyMap(),
+    /** 非空表示自定义主题生效，覆盖 [theme]；选内置主题时清空。 */
+    val activeCustomThemeId: Long? = null,
+    /**
+     * 日夜自动切换：开启后深色模式下改用夜间槽的配色与背景图。默认关闭——
+     * 老配置只有一套纸色，默默换成两套等于替用户改了外观。
+     */
+    val dayNightThemeAuto: Boolean = false,
+    /** 夜间槽的内置主题。 */
+    val nightTheme: ReaderTheme = ReaderTheme.DARK,
+    /** 夜间槽的自定义主题；语义同 [activeCustomThemeId]。 */
+    val nightActiveCustomThemeId: Long? = null,
+    /** 夜间槽的背景图。 */
+    val nightSelectedBackgroundImageId: String? = null,
+    /** 夜间槽的背景图不透明度。 */
+    val nightBackgroundImageOpacity: Float = 0.28f,
+    /** 用户主动启用的逐书主题；键为 books.id。 */
+    val bookThemes: Map<Long, BookReaderTheme> = emptyMap(),
+    val bookChineseConversions: Map<Long, ChineseConversionMode> = emptyMap(),
+    /** Empty follows the book/default reading font; built-in name or font:<asset id> overrides review quotes only. */
+    val reviewFont: String = "",
+    val reviewPreferences: ReadingReviewPreferences = ReadingReviewPreferences(),
+    val reviewShareTemplates: List<ReviewShareTemplate> = emptyList()
+)
+
+/** 当前生效的自定义主题；id 悬空（预设已删）按未启用处理。 */
+fun ReaderSettings.activeCustomTheme(): CustomReaderTheme? =
+    activeCustomThemeId?.let { id -> customThemes.firstOrNull { it.id == id } }
+
+@Singleton
+class ReaderSettingsRepository @Inject constructor(
+    private val dataStore: DataStore<Preferences>
+) {
+    val settings: Flow<ReaderSettings> = dataStore.data.map { preferences ->
+        val legacyPath = preferences[Keys.CustomFontPath]?.takeIf(String::isNotBlank)
+        val legacyName = preferences[Keys.CustomFontName]?.takeIf(String::isNotBlank)
+        val fontLibrary = ReaderFontLibraryCodec.includeLegacy(
+            ReaderFontLibraryCodec.decode(preferences[Keys.FontLibrary]),
+            legacyPath,
+            legacyName
+        )
+        val selectedFontId = preferences[Keys.SelectedCustomFontId]
+            ?.takeIf { id -> fontLibrary.any { it.id == id } }
+            ?: legacyPath?.let { path -> fontLibrary.firstOrNull { it.filePath == path }?.id }
+            ?: fontLibrary.firstOrNull()?.id
+        val selectedFont = fontLibrary.firstOrNull { it.id == selectedFontId }
+        val legacyBackgroundPath = preferences[Keys.BackgroundImagePath]
+            ?.takeIf(String::isNotBlank)
+        val imageLibrary = ReaderImageLibraryCodec.includeLegacyBackground(
+            ReaderImageLibraryCodec.decode(preferences[Keys.ImageLibrary]),
+            legacyBackgroundPath
+        )
+        val selectedBackgroundId = preferences[Keys.SelectedBackgroundImageId]
+            ?.takeIf { id -> imageLibrary.any { it.id == id } }
+            ?: legacyBackgroundPath?.let { path ->
+                imageLibrary.firstOrNull { it.filePath == path }?.id
+            }
+        val selectedBackground = imageLibrary.firstOrNull { it.id == selectedBackgroundId }
+        ReaderSettings(
+            fontScale = preferences[Keys.FontScale] ?: 1f,
+            font = preferences[Keys.Font]
+                ?.let { runCatching { ReaderFont.valueOf(it) }.getOrNull() }
+                ?: ReaderFont.SYSTEM,
+            customFontPath = selectedFont?.filePath,
+            customFontName = selectedFont?.displayName,
+            fontLibrary = fontLibrary,
+            selectedCustomFontId = selectedFontId,
+            fontWeight = (preferences[Keys.FontWeight] ?: 400).coerceIn(300, 700),
+            lineHeight = (preferences[Keys.LineHeight] ?: 1.55f).coerceIn(1f, 2.2f),
+            publisherStyleMode = preferences[Keys.PublisherStyleMode]
+                ?.let { runCatching { PublisherStyleMode.valueOf(it) }.getOrNull() }
+                ?: PublisherStyleMode.SMART,
+            pageMargin = (preferences[Keys.PageMargin] ?: 1f).coerceIn(0f, 2f),
+            pageMarginLeft = (preferences[Keys.PageMarginLeft]
+                ?: preferences[Keys.PageMargin]
+                ?: 1f).coerceIn(0f, 2f),
+            pageMarginRight = (preferences[Keys.PageMarginRight]
+                ?: preferences[Keys.PageMargin]
+                ?: 1f).coerceIn(0f, 2f),
+            pageMarginTop = (preferences[Keys.PageMarginTop] ?: 0f).coerceIn(0f, 2f),
+            pageMarginBottom = (preferences[Keys.PageMarginBottom] ?: 0f).coerceIn(0f, 2f),
+            headerMarginTop = (preferences[Keys.HeaderMarginTop] ?: 0f).coerceIn(0f, 2f),
+            footerMarginBottom = (preferences[Keys.FooterMarginBottom] ?: 0f).coerceIn(0f, 2f),
+            letterSpacingEm = (preferences[Keys.LetterSpacingEm] ?: 0f).coerceIn(-0.05f, 0.2f),
+            paragraphSpacingEm = (preferences[Keys.ParagraphSpacingEm] ?: 0.55f).coerceIn(0f, 1.5f),
+            firstLineIndentEm = (preferences[Keys.FirstLineIndentEm] ?: 2f).coerceIn(0f, 4f),
+            titleScale = (preferences[Keys.TitleScale] ?: 1.35f).coerceIn(1f, 2f),
+            titleTopSpacing = (preferences[Keys.TitleTopSpacing] ?: 0.4f).coerceIn(0f, 3f),
+            titleBottomSpacing = (preferences[Keys.TitleBottomSpacing] ?: 1f).coerceIn(0f, 3f),
+            titleStyle = ReaderTitleStyleCodec.decode(preferences[Keys.TitleStyle]),
+            titleStylePresets = ReaderTitleStylePresetCodec.decode(preferences[Keys.TitleStylePresets]),
+            textJustification = preferences[Keys.TextJustification] ?: true,
+            showHeader = preferences[Keys.ShowHeader] ?: true,
+            showFooter = preferences[Keys.ShowFooter] ?: true,
+            theme = preferences[Keys.Theme]
+                ?.let { runCatching { ReaderTheme.valueOf(it) }.getOrNull() }
+                ?: ReaderTheme.SYSTEM,
+            // 2026-08-03 滚动模式回归：以章节为单位的连续滚动（上下滑动翻页）。
+            widePageLayout = preferences[Keys.WidePageLayout]
+                ?.let { runCatching { WidePageLayout.valueOf(it) }.getOrNull() } ?: WidePageLayout.SINGLE,
+            companionSidePaneEnabled = preferences[Keys.CompanionSidePaneEnabled] ?: false,
+            pageMode = preferences[Keys.PageMode]
+                ?.let { runCatching { PageMode.valueOf(it) }.getOrNull() }
+                ?: PageMode.PAGINATED,
+            autoRead = AutoReadSettings(
+                mode = preferences[Keys.AutoReadMode]?.let { runCatching { PageMode.valueOf(it) }.getOrNull() } ?: PageMode.SCROLL,
+                scrollDpPerSecond = preferences[Keys.AutoReadSpeed] ?: 24f,
+                pageIntervalSeconds = preferences[Keys.AutoReadInterval] ?: 15,
+                showGuide = preferences[Keys.AutoReadGuide] ?: false
+            ).normalized(),
+            pageTurnAnimation = preferences[Keys.PageTurnAnimation]
+                ?.let { runCatching { PageTurnAnimation.valueOf(it) }.getOrNull() }
+                ?: PageTurnAnimation.SIMULATION,
+            modernBackTextOpacity = (preferences[Keys.ModernBackTextOpacity] ?: .18f).coerceIn(0f, 1f),
+            modernCurlRadiusScale = (preferences[Keys.ModernCurlRadiusScale] ?: 1f).coerceIn(.6f, 1.8f),
+            shelfLayout = preferences[Keys.ShelfLayout]
+                ?.let { runCatching { ShelfLayout.valueOf(it) }.getOrNull() }
+                ?: ShelfLayout.GRID,
+            shelfBookOrder = preferences[Keys.ShelfBookOrder]
+                ?.split(',')
+                ?.mapNotNull(String::toLongOrNull)
+                .orEmpty(),
+            shelfBookOrderReadAnchor = preferences[Keys.ShelfBookOrderReadAnchor] ?: 0L,
+            readingOrderAffectsShelf = preferences[Keys.ReadingOrderAffectsShelf] ?: true,
+            keepScreenOn = preferences[Keys.KeepScreenOn] ?: false,
+            immersiveReading = preferences[Keys.ImmersiveReading] ?: true,
+            volumeKeysPageTurn = preferences[Keys.VolumeKeysPageTurn] ?: false,
+            physicalKeyBindings = ReaderKeyBindings.decode(preferences[Keys.PhysicalKeyBindings]),
+            tapZones = ReaderTapZones.decode(preferences[Keys.TapZones]),
+            englishLearningEnabled = preferences[Keys.EnglishLearning] ?: false,
+            englishBionicEnabled = preferences[Keys.EnglishBionic] ?: false,
+            bilingualBooks = preferences[Keys.BilingualBooks].orEmpty().mapNotNull { it.toLongOrNull() }.toSet(),
+            wordAnnotationMode = preferences[Keys.WordAnnotationMode]?.let { name ->
+                com.mozhi.reader.core.dictionary.WordAnnotationMode.entries.firstOrNull { it.name == name }
+            } ?: com.mozhi.reader.core.dictionary.WordAnnotationMode.INLINE,
+            vocabulary = runCatching { com.mozhi.reader.core.dictionary.VocabularyCodec.decode(preferences[Keys.Vocabulary]) }.getOrDefault(emptyList()),
+            screenBrightness = preferences[Keys.ScreenBrightness] ?: FOLLOW_SYSTEM_BRIGHTNESS,
+            backgroundImagePath = selectedBackground?.filePath ?: legacyBackgroundPath,
+            imageLibrary = imageLibrary,
+            selectedBackgroundImageId = selectedBackgroundId,
+            backgroundImageOpacity = (preferences[Keys.BackgroundImageOpacity] ?: 0.28f)
+                .coerceIn(0.05f, 1f),
+            syntaxHighlightEnabled = preferences[Keys.SyntaxHighlightEnabled] ?: false,
+            syntaxHighlightRules = ReaderSyntaxRuleCodec.decode(preferences[Keys.SyntaxHighlightRules]),
+            textReplacementRules = ReaderTextReplacementRuleCodec.decode(
+                preferences[Keys.TextReplacementRules]
+            ),
+            customThemes = CustomReaderThemeCodec.decode(preferences[Keys.CustomThemes]),
+            builtinThemeTypography = ReaderThemeTypographyCodec.decode(preferences[Keys.BuiltinThemeTypography]),
+            activeCustomThemeId = preferences[Keys.ActiveCustomThemeId],
+            dayNightThemeAuto = preferences[Keys.DayNightThemeAuto] ?: false,
+            nightTheme = preferences[Keys.NightTheme]
+                ?.let { runCatching { ReaderTheme.valueOf(it) }.getOrNull() }
+                ?: ReaderTheme.DARK,
+            nightActiveCustomThemeId = preferences[Keys.NightActiveCustomThemeId],
+            nightSelectedBackgroundImageId = preferences[Keys.NightSelectedBackgroundImageId]
+                ?.takeIf { id -> imageLibrary.any { it.id == id } },
+            nightBackgroundImageOpacity = (preferences[Keys.NightBackgroundImageOpacity] ?: 0.28f)
+                .coerceIn(0.05f, 1f),
+            bookThemes = BookReaderThemeCodec.decode(preferences[Keys.BookThemes]),
+            reviewShareTemplates = ReviewShareTemplateCodec.decode(preferences[Keys.ReviewShareTemplates]),
+            reviewPreferences = ReadingReviewPreferencesCodec.decode(preferences[Keys.ReviewPreferences]),
+            reviewFont = preferences[Keys.ReviewFont]?.takeIf { value ->
+                ReaderFont.entries.any { it != ReaderFont.CUSTOM && it.name == value } ||
+                    (value.startsWith("font:") && fontLibrary.any { it.id == value.removePrefix("font:") })
+            }.orEmpty(),
+            bookChineseConversions = BookChineseConversionCodec.decode(
+                preferences[Keys.BookChineseConversions]
+            )
+        )
+    }
+
+    /**
+     * 进程级热缓存：阅读页首帧要同步拿到真实纸色与排版，冷读 DataStore 会先用
+     * 默认值画一帧再跳变（进场转场中途背景变色）。Eagerly 随单例构造预热；
+     * 进程冷启动瞬间取到默认值属可接受回落。需要「等到真实值」的写路径仍用
+     * [settings].first()。
+     */
+    val cachedSettings: StateFlow<ReaderSettings> = settings.stateIn(
+        scope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+        started = SharingStarted.Eagerly,
+        initialValue = ReaderSettings()
+    )
+
+    /** 外观偏好独立成流：MainActivity 只关心这三项，不必因字号变化重组整棵树。 */
+    val appearance: Flow<AppearanceSettings> = dataStore.data.map { preferences ->
+        AppearanceSettings(
+            themeMode = preferences[Keys.ThemeMode]
+                ?.let { runCatching { ThemeMode.valueOf(it) }.getOrNull() }
+                ?: ThemeMode.SYSTEM,
+            accent = preferences[Keys.AccentPreset]
+                ?.let { runCatching { AccentPreset.valueOf(it) }.getOrNull() }
+                ?: AccentPreset.Default,
+            customAccentArgb = preferences[Keys.AccentCustomArgb],
+            appFont = fontLibraryFrom(preferences).firstOrNull { it.id == preferences[Keys.AppFontId] },
+            colorScheme = preferences[Keys.ColorScheme].toEnumOr(ColorSchemePreset.Default).availableOn(Build.VERSION.SDK_INT),
+            semanticHarmony = preferences[Keys.SemanticHarmony].toEnumOr(SemanticHarmony.Default),
+            surfaceStyle = preferences[Keys.SurfaceStyle].toEnumOr(SurfaceStyle.Default),
+            navStyle = preferences[Keys.NavStyle].toEnumOr(NavStyle.Default),
+            shapeStyle = preferences[Keys.ShapeStyle].toEnumOr(ShapeStyle.Default)
+        )
+    }
+
+    private inline fun <reified T : Enum<T>> String?.toEnumOr(fallback: T): T =
+        this?.let { runCatching { enumValueOf<T>(it) }.getOrNull() } ?: fallback
+
+    /**
+     * 选配色方案：强调色置为「随方案」，并一并套用方案推荐的质感与形状。
+     * 之后用户仍可在设置里单独改回；导航样式不在推荐范围内，保持用户所选。
+     */
+    suspend fun setColorScheme(value: ColorSchemePreset) {
+        val available = value.availableOn(Build.VERSION.SDK_INT)
+        dataStore.edit {
+            it[Keys.ColorScheme] = available.name
+            it[Keys.AccentPreset] = AccentPreset.FOLLOW.name
+            it.remove(Keys.AccentCustomArgb)
+            it[Keys.SurfaceStyle] = available.recommendedSurface.name
+            it[Keys.ShapeStyle] = available.recommendedShape.name
+            if (available == ColorSchemePreset.NEUTRAL) {
+                it[Keys.NavStyle] = NavStyle.Default.name
+                it[Keys.SemanticHarmony] = SemanticHarmony.Default.name
+            }
+        }
+    }
+
+    suspend fun setSemanticHarmony(value: SemanticHarmony) {
+        dataStore.edit { it[Keys.SemanticHarmony] = value.name }
+    }
+
+    suspend fun setSurfaceStyle(value: SurfaceStyle) {
+        dataStore.edit { it[Keys.SurfaceStyle] = value.name }
+    }
+
+    suspend fun setNavStyle(value: NavStyle) {
+        dataStore.edit { it[Keys.NavStyle] = value.name }
+    }
+
+    suspend fun setShapeStyle(value: ShapeStyle) {
+        dataStore.edit { it[Keys.ShapeStyle] = value.name }
+    }
+
+    suspend fun setThemeMode(value: ThemeMode) {
+        dataStore.edit { it[Keys.ThemeMode] = value.name }
+    }
+
+    /** 选中预设即清掉自定义色，否则自定义会一直盖住预设。 */
+    suspend fun setAccentPreset(value: AccentPreset) {
+        dataStore.edit {
+            it[Keys.AccentPreset] = value.name
+            it.remove(Keys.AccentCustomArgb)
+        }
+    }
+
+    suspend fun setCustomAccent(argb: Int) {
+        dataStore.edit { it[Keys.AccentCustomArgb] = argb }
+    }
+
+    suspend fun setFontScale(value: Float) {
+        dataStore.edit { it[Keys.FontScale] = value.coerceIn(0.75f, 2f) }
+    }
+
+    /** 应用字体只影响 Compose 界面，不改变阅读排版设置。 */
+    suspend fun selectAppFont(id: String?) {
+        dataStore.edit { preferences ->
+            if (id == null) preferences.remove(Keys.AppFontId)
+            else {
+                require(fontLibraryFrom(preferences).any { it.id == id }) { "字体不存在或已删除" }
+                preferences[Keys.AppFontId] = id
+            }
+        }
+    }
+
+    suspend fun setFont(value: ReaderFont) {
+        dataStore.edit { it[Keys.Font] = value.name }
+    }
+
+    suspend fun addCustomFont(font: ReaderFontAsset, select: Boolean = true) {
+        dataStore.edit { preferences ->
+            val existing = fontLibraryFrom(preferences)
+            preferences[Keys.FontLibrary] = ReaderFontLibraryCodec.encode(
+                existing.filterNot { it.id == font.id || it.filePath == font.filePath } + font
+            )
+            preferences.remove(Keys.CustomFontPath)
+            preferences.remove(Keys.CustomFontName)
+            if (select) {
+                preferences[Keys.SelectedCustomFontId] = font.id
+                preferences[Keys.Font] = ReaderFont.CUSTOM.name
+            }
+        }
+    }
+
+    suspend fun selectCustomFont(id: String) {
+        dataStore.edit { preferences ->
+            require(fontLibraryFrom(preferences).any { it.id == id }) { "字体不存在或已删除" }
+            preferences[Keys.SelectedCustomFontId] = id
+            preferences[Keys.Font] = ReaderFont.CUSTOM.name
+        }
+    }
+
+    suspend fun renameCustomFont(id: String, displayName: String) {
+        val name = displayName.trim().take(48)
+        require(name.isNotBlank()) { "字体名称不能为空" }
+        dataStore.edit { preferences ->
+            val fonts = fontLibraryFrom(preferences)
+            require(fonts.any { it.id == id }) { "字体不存在或已删除" }
+            preferences[Keys.FontLibrary] = ReaderFontLibraryCodec.encode(
+                fonts.map { if (it.id == id) it.copy(displayName = name) else it }
+            )
+            preferences.remove(Keys.CustomFontPath)
+            preferences.remove(Keys.CustomFontName)
+        }
+    }
+
+    suspend fun removeCustomFont(id: String) {
+        dataStore.edit { preferences ->
+            if (preferences[Keys.AppFontId] == id) preferences.remove(Keys.AppFontId)
+            val remaining = fontLibraryFrom(preferences).filterNot { it.id == id }
+            preferences[Keys.FontLibrary] = ReaderFontLibraryCodec.encode(remaining)
+            preferences.remove(Keys.CustomFontPath)
+            preferences.remove(Keys.CustomFontName)
+            if (preferences[Keys.SelectedCustomFontId] == id) {
+                preferences.remove(Keys.SelectedCustomFontId)
+                if (preferences[Keys.Font] == ReaderFont.CUSTOM.name) {
+                    preferences[Keys.Font] = ReaderFont.SYSTEM.name
+                }
+            }
+            val rules = ReaderSyntaxRuleCodec.decode(preferences[Keys.SyntaxHighlightRules])
+            val repaired = rules.map { rule ->
+                if (rule.fontAssetId == id) {
+                    rule.copy(font = ReaderSyntaxFont.INHERIT, fontAssetId = null)
+                } else {
+                    rule
+                }
+            }
+            if (repaired != rules) {
+                preferences[Keys.SyntaxHighlightRules] = ReaderSyntaxRuleCodec.encode(repaired)
+            }
+        }
+    }
+
+    suspend fun setCustomFont(path: String?, displayName: String? = null) {
+        if (path.isNullOrBlank()) {
+            setFont(ReaderFont.SYSTEM)
+            return
+        }
+        addCustomFont(
+            ReaderFontAsset(
+                id = ReaderFontLibraryCodec.legacyId(path),
+                displayName = displayName?.trim()?.takeIf { it.isNotBlank() } ?: "已导入字体",
+                filePath = path
+            )
+        )
+    }
+
+    /** 兼容旧调用；新导入流程应同时传入自动识别的名称。 */
+    suspend fun setCustomFontPath(path: String?) = setCustomFont(path)
+
+    suspend fun renameCustomFont(displayName: String) {
+        val current = settings.first().selectedCustomFontId ?: return
+        renameCustomFont(current, displayName)
+    }
+
+    suspend fun setFontWeight(value: Int) {
+        dataStore.edit { it[Keys.FontWeight] = value.coerceIn(300, 700) }
+    }
+
+    suspend fun setLineHeight(value: Float) {
+        dataStore.edit { it[Keys.LineHeight] = value.coerceIn(1f, 2.2f) }
+    }
+
+    suspend fun setPublisherStyleMode(value: PublisherStyleMode) {
+        dataStore.edit { it[Keys.PublisherStyleMode] = value.name }
+    }
+
+    suspend fun setPageMargin(value: Float) {
+        val safe = value.coerceIn(0f, 2f)
+        dataStore.edit {
+            it[Keys.PageMargin] = safe
+            it[Keys.PageMarginLeft] = safe
+            it[Keys.PageMarginRight] = safe
+            it[Keys.PageMarginTop] = safe
+            it[Keys.PageMarginBottom] = safe
+        }
+    }
+
+    suspend fun setPageMarginLeft(value: Float) {
+        dataStore.edit { it[Keys.PageMarginLeft] = value.coerceIn(0f, 2f) }
+    }
+
+    suspend fun setPageMarginRight(value: Float) {
+        dataStore.edit { it[Keys.PageMarginRight] = value.coerceIn(0f, 2f) }
+    }
+
+    suspend fun setPageMarginTop(value: Float) {
+        dataStore.edit { it[Keys.PageMarginTop] = value.coerceIn(0f, 2f) }
+    }
+
+    suspend fun setPageMarginBottom(value: Float) {
+        dataStore.edit { it[Keys.PageMarginBottom] = value.coerceIn(0f, 2f) }
+    }
+
+    suspend fun setHeaderMarginTop(value: Float) {
+        dataStore.edit { it[Keys.HeaderMarginTop] = value.coerceIn(0f, 2f) }
+    }
+
+    suspend fun setFooterMarginBottom(value: Float) {
+        dataStore.edit { it[Keys.FooterMarginBottom] = value.coerceIn(0f, 2f) }
+    }
+
+    suspend fun setLetterSpacingEm(value: Float) {
+        dataStore.edit { it[Keys.LetterSpacingEm] = value.coerceIn(-0.05f, 0.2f) }
+    }
+
+    suspend fun setParagraphSpacingEm(value: Float) {
+        dataStore.edit { it[Keys.ParagraphSpacingEm] = value.coerceIn(0f, 1.5f) }
+    }
+
+    suspend fun setFirstLineIndentEm(value: Float) {
+        dataStore.edit { it[Keys.FirstLineIndentEm] = value.coerceIn(0f, 4f) }
+    }
+
+    suspend fun setTitleScale(value: Float) {
+        dataStore.edit { it[Keys.TitleScale] = value.coerceIn(1f, 2f) }
+    }
+
+    suspend fun setTitleTopSpacing(value: Float) {
+        dataStore.edit { it[Keys.TitleTopSpacing] = value.coerceIn(0f, 3f) }
+    }
+
+    suspend fun setTitleBottomSpacing(value: Float) {
+        dataStore.edit { it[Keys.TitleBottomSpacing] = value.coerceIn(0f, 3f) }
+    }
+
+    suspend fun setReviewFont(value: String) {
+        dataStore.edit { preferences ->
+            if (value.isEmpty()) preferences.remove(Keys.ReviewFont)
+            else {
+                require(ReaderFont.entries.any { it != ReaderFont.CUSTOM && it.name == value } ||
+                    (value.startsWith("font:") && fontLibraryFrom(preferences).any { it.id == value.removePrefix("font:") })) {
+                    "字体不存在或已删除"
+                }
+                preferences[Keys.ReviewFont] = value
+            }
+        }
+    }
+
+    suspend fun setReviewPreferences(value: ReadingReviewPreferences) {
+        dataStore.edit { it[Keys.ReviewPreferences] = ReadingReviewPreferencesCodec.encode(value) }
+    }
+
+    suspend fun saveReviewShareTemplate(template: ReviewShareTemplate) {
+        require(template.id.isNotBlank() && template.name.isNotBlank()) { "请为模板命名" }
+        val errors = ReviewTemplateCss.parse(template.css).declarations.errors +
+            template.syntaxRules.flatMap { ReaderStyleCss.parse(it.css).errors }
+        require(errors.isEmpty()) { errors.joinToString("\n") }
+        dataStore.edit { preferences ->
+            val existing = ReviewShareTemplateCodec.decode(preferences[Keys.ReviewShareTemplates])
+            preferences[Keys.ReviewShareTemplates] = ReviewShareTemplateCodec.encode(
+                existing.filterNot { it.id == template.id } + template.copy(name = template.name.trim())
+            )
+        }
+    }
+
+    suspend fun deleteReviewShareTemplate(id: String) {
+        dataStore.edit { preferences ->
+            preferences[Keys.ReviewShareTemplates] = ReviewShareTemplateCodec.encode(
+                ReviewShareTemplateCodec.decode(preferences[Keys.ReviewShareTemplates]).filterNot { it.id == id }
+            )
+        }
+    }
+
+    suspend fun setTitleStyle(value: ReaderTitleStyle) {
+        dataStore.edit { it[Keys.TitleStyle] = ReaderTitleStyleCodec.encode(value) }
+    }
+
+    suspend fun saveTitleStylePreset(value: ReaderTitleStylePreset) {
+        val preset = value.copy(name = value.name.trim().take(30).ifBlank { "自定义样式" }, style = value.style.copy(presetId = null))
+        if (preset.id.isBlank()) return
+        dataStore.edit { preferences ->
+            val current = ReaderTitleStylePresetCodec.decode(preferences[Keys.TitleStylePresets])
+            val updated = if (current.any { it.id == preset.id }) current.map { if (it.id == preset.id) preset else it }
+                else listOf(preset) + current
+            preferences[Keys.TitleStylePresets] = ReaderTitleStylePresetCodec.encode(updated)
+        }
+    }
+
+    /** Detach references with their latest appearance, keeping every bound theme visually stable. */
+    suspend fun deleteTitleStylePreset(id: String) {
+        dataStore.edit { preferences ->
+            val current = ReaderTitleStylePresetCodec.decode(preferences[Keys.TitleStylePresets])
+            val preset = current.firstOrNull { it.id == id } ?: return@edit
+            fun detach(style: ReaderTitleStyle) = if (style.presetId == id) preset.style.copy(presetId = null) else style
+            preferences[Keys.TitleStyle] = ReaderTitleStyleCodec.encode(detach(ReaderTitleStyleCodec.decode(preferences[Keys.TitleStyle])))
+            preferences[Keys.CustomThemes] = CustomReaderThemeCodec.encode(CustomReaderThemeCodec.decode(preferences[Keys.CustomThemes])
+                .map { it.copy(titleStyle = detach(it.titleStyle)) })
+            preferences[Keys.BuiltinThemeTypography] = ReaderThemeTypographyCodec.encode(ReaderThemeTypographyCodec.decode(preferences[Keys.BuiltinThemeTypography])
+                .mapValues { (_, theme) -> theme.copy(titleStyle = detach(theme.titleStyle)) })
+            preferences[Keys.TitleStylePresets] = ReaderTitleStylePresetCodec.encode(current.filterNot { it.id == id })
+        }
+    }
+
+    suspend fun setTextJustification(value: Boolean) {
+        dataStore.edit { it[Keys.TextJustification] = value }
+    }
+
+    suspend fun setShowHeader(value: Boolean) {
+        dataStore.edit { it[Keys.ShowHeader] = value }
+    }
+
+    suspend fun setShowFooter(value: Boolean) {
+        dataStore.edit { it[Keys.ShowFooter] = value }
+    }
+
+    /** 选内置主题即退出自定义主题，两者互斥（与强调色预设/自定义同款语义）。 */
+    suspend fun setTheme(value: ReaderTheme, slot: ReaderThemeSlot = ReaderThemeSlot.DAY) {
+        dataStore.edit {
+            it[themeKey(slot)] = value.name
+            it.remove(customThemeKey(slot))
+        }
+    }
+
+    /**
+     * 日夜自动切换。首次开启时若夜间槽还没配过，种一套内置「夜间」纸色——
+     * 只补空，不动用户已经配好的日间槽。
+     */
+    suspend fun setDayNightThemeAuto(enabled: Boolean) {
+        dataStore.edit { preferences ->
+            preferences[Keys.DayNightThemeAuto] = enabled
+            if (enabled && preferences[Keys.NightTheme] == null &&
+                preferences[Keys.NightActiveCustomThemeId] == null
+            ) {
+                preferences[Keys.NightTheme] = ReaderTheme.DARK.name
+            }
+        }
+    }
+
+    suspend fun setBookThemeEnabled(bookId: Long, enabled: Boolean) {
+        require(bookId > 0L)
+        dataStore.edit { preferences ->
+            val themes = BookReaderThemeCodec.decode(preferences[Keys.BookThemes]).toMutableMap()
+            val current = themes[bookId] ?: BookReaderTheme(
+                dayTheme = preferences[Keys.Theme]
+                    ?.let { runCatching { ReaderTheme.valueOf(it) }.getOrNull() }
+                    ?: ReaderTheme.LIGHT,
+                dayCustomThemeId = preferences[Keys.ActiveCustomThemeId],
+                nightTheme = preferences[Keys.NightTheme]
+                    ?.let { runCatching { ReaderTheme.valueOf(it) }.getOrNull() }
+                    ?: ReaderTheme.DARK,
+                nightCustomThemeId = preferences[Keys.NightActiveCustomThemeId]
+            )
+            themes[bookId] = current.copy(enabled = enabled)
+            preferences[Keys.BookThemes] = BookReaderThemeCodec.encode(themes)
+        }
+    }
+
+    suspend fun setBookTheme(bookId: Long, theme: ReaderTheme, slot: ReaderThemeSlot) {
+        updateBookTheme(bookId) { it.withTheme(slot, theme) }
+    }
+
+    suspend fun setBookChineseConversionMode(bookId: Long, mode: ChineseConversionMode) {
+        dataStore.edit { preferences ->
+            val values = BookChineseConversionCodec
+                .decode(preferences[Keys.BookChineseConversions])
+                .toMutableMap()
+            if (mode == ChineseConversionMode.OFF) values.remove(bookId) else values[bookId] = mode
+            preferences[Keys.BookChineseConversions] = BookChineseConversionCodec.encode(values)
+        }
+    }
+
+    suspend fun selectBookCustomTheme(bookId: Long, id: Long, slot: ReaderThemeSlot) {
+        dataStore.edit { preferences ->
+            if (CustomReaderThemeCodec.decode(preferences[Keys.CustomThemes]).none { it.id == id }) {
+                return@edit
+            }
+            val themes = BookReaderThemeCodec.decode(preferences[Keys.BookThemes]).toMutableMap()
+            val current = themes[bookId] ?: BookReaderTheme(enabled = true)
+            themes[bookId] = current.withCustomTheme(slot, id)
+            preferences[Keys.BookThemes] = BookReaderThemeCodec.encode(themes)
+        }
+    }
+
+    private suspend fun updateBookTheme(bookId: Long, transform: (BookReaderTheme) -> BookReaderTheme) {
+        require(bookId > 0L)
+        dataStore.edit { preferences ->
+            val themes = BookReaderThemeCodec.decode(preferences[Keys.BookThemes]).toMutableMap()
+            themes[bookId] = transform(themes[bookId] ?: BookReaderTheme(enabled = true))
+            preferences[Keys.BookThemes] = BookReaderThemeCodec.encode(themes)
+        }
+    }
+
+    /** 保存（新建或覆盖）自定义主题并立即应用到指定槽；返回落盘的 id。 */
+    suspend fun saveCustomTheme(
+        theme: CustomReaderTheme,
+        slot: ReaderThemeSlot = ReaderThemeSlot.DAY
+    ): Long {
+        var assigned = theme.id
+        dataStore.edit { preferences ->
+            val existing = CustomReaderThemeCodec.decode(preferences[Keys.CustomThemes])
+            if (assigned == 0L) assigned = (existing.maxOfOrNull { it.id } ?: 0L) + 1
+            val saved = theme.copy(id = assigned)
+            preferences[Keys.CustomThemes] = CustomReaderThemeCodec.encode(
+                existing.filterNot { it.id == assigned } + saved
+            )
+            applyCustomTheme(preferences, saved, slot)
+        }
+        return assigned
+    }
+
+    /** 保存本书使用的预设，但不改写其他书正在使用的全局排版。 */
+    suspend fun saveBookCustomTheme(
+        bookId: Long,
+        theme: CustomReaderTheme,
+        slot: ReaderThemeSlot
+    ): Long {
+        var assigned = theme.id
+        dataStore.edit { preferences ->
+            persistLegacyReaderAssets(preferences)
+            val existing = CustomReaderThemeCodec.decode(preferences[Keys.CustomThemes])
+            if (assigned == 0L) assigned = (existing.maxOfOrNull { it.id } ?: 0L) + 1
+            val saved = theme.copy(id = assigned)
+            persistThemeAssets(preferences, saved)
+            preferences[Keys.CustomThemes] = CustomReaderThemeCodec.encode(
+                existing.filterNot { it.id == assigned } + saved
+            )
+            val bookThemes = BookReaderThemeCodec.decode(preferences[Keys.BookThemes]).toMutableMap()
+            bookThemes[bookId] = (bookThemes[bookId] ?: BookReaderTheme(enabled = true))
+                .withCustomTheme(slot, assigned)
+                .copy(enabled = true)
+            preferences[Keys.BookThemes] = BookReaderThemeCodec.encode(bookThemes)
+        }
+        return assigned
+    }
+
+    suspend fun deleteCustomTheme(id: Long) {
+        dataStore.edit { preferences ->
+            val remaining = CustomReaderThemeCodec.decode(preferences[Keys.CustomThemes])
+                .filterNot { it.id == id }
+            preferences[Keys.CustomThemes] = CustomReaderThemeCodec.encode(remaining)
+            ReaderThemeSlot.entries.forEach { slot ->
+                if (preferences[customThemeKey(slot)] == id) preferences.remove(customThemeKey(slot))
+            }
+            val repairedBookThemes = BookReaderThemeCodec.decode(preferences[Keys.BookThemes])
+                .mapValues { (_, value) ->
+                    value.copy(
+                        dayCustomThemeId = value.dayCustomThemeId?.takeUnless { it == id },
+                        nightCustomThemeId = value.nightCustomThemeId?.takeUnless { it == id }
+                    )
+                }
+            preferences[Keys.BookThemes] = BookReaderThemeCodec.encode(repairedBookThemes)
+        }
+    }
+
+    suspend fun selectCustomTheme(id: Long, slot: ReaderThemeSlot = ReaderThemeSlot.DAY) {
+        dataStore.edit { preferences ->
+            val theme = CustomReaderThemeCodec.decode(preferences[Keys.CustomThemes])
+                .firstOrNull { it.id == id } ?: return@edit
+            applyCustomTheme(preferences, theme, slot)
+        }
+    }
+
+    /**
+     * 配色、背景归所选槽，排版快照写入全局作为退出预设后的基准。
+     * 阅读时按当前日夜槽解析绑定快照；后续细调原子更新对应预设。
+     */
+    private fun applyCustomTheme(
+        preferences: androidx.datastore.preferences.core.MutablePreferences,
+        theme: CustomReaderTheme,
+        slot: ReaderThemeSlot
+    ) {
+        persistLegacyReaderAssets(preferences)
+        persistThemeAssets(preferences, theme)
+        preferences[customThemeKey(slot)] = theme.id
+        preferences[Keys.FontScale] = theme.fontScale.coerceIn(0.7f, 1.8f)
+        preferences[Keys.Font] = theme.font.name
+        preferences[Keys.FontWeight] = theme.fontWeight.coerceIn(300, 700)
+        preferences[Keys.LineHeight] = theme.lineHeight.coerceIn(1f, 2.2f)
+        preferences[Keys.PageMarginLeft] = theme.pageMarginLeft.coerceIn(0f, 2f)
+        preferences[Keys.PageMarginRight] = theme.pageMarginRight.coerceIn(0f, 2f)
+        preferences[Keys.PageMarginTop] = theme.pageMarginTop.coerceIn(0f, 2f)
+        preferences[Keys.PageMarginBottom] = theme.pageMarginBottom.coerceIn(0f, 2f)
+        preferences[Keys.LetterSpacingEm] = theme.letterSpacingEm.coerceIn(-0.05f, 0.2f)
+        preferences[Keys.ParagraphSpacingEm] = theme.paragraphSpacingEm.coerceIn(0f, 1.5f)
+        preferences[Keys.FirstLineIndentEm] = theme.firstLineIndentEm.coerceIn(0f, 4f)
+        preferences[Keys.TitleScale] = theme.titleScale.coerceIn(1f, 2f)
+        preferences[Keys.TitleTopSpacing] = theme.titleTopSpacing.coerceIn(0f, 3f)
+        preferences[Keys.TitleBottomSpacing] = theme.titleBottomSpacing.coerceIn(0f, 3f)
+        preferences[Keys.TitleStyle] = ReaderTitleStyleCodec.encode(theme.titleStyle)
+        preferences[Keys.PublisherStyleMode] = theme.publisherStyleMode.name
+        preferences[Keys.HeaderMarginTop] = theme.headerMarginTop.coerceIn(0f, 2f)
+        preferences[Keys.FooterMarginBottom] = theme.footerMarginBottom.coerceIn(0f, 2f)
+        preferences[Keys.TextJustification] = theme.textJustification
+        preferences[Keys.ShowHeader] = theme.showHeader
+        preferences[Keys.ShowFooter] = theme.showFooter
+        preferences[backgroundOpacityKey(slot)] =
+            theme.backgroundImageOpacity.coerceIn(0.05f, 1f)
+
+        val fontId = theme.customFontId ?: theme.customFontPath?.let(ReaderFontLibraryCodec::legacyId)
+        if (theme.font == ReaderFont.CUSTOM && fontId != null) {
+            preferences[Keys.SelectedCustomFontId] = fontId
+        } else {
+            preferences.remove(Keys.SelectedCustomFontId)
+        }
+        val backgroundId = theme.backgroundImageId
+            ?: theme.backgroundImagePath?.let(ReaderImageLibraryCodec::legacyId)
+        backgroundId?.let { preferences[backgroundImageKey(slot)] = it }
+            ?: preferences.remove(backgroundImageKey(slot))
+        preferences.remove(Keys.CustomFontPath)
+        preferences.remove(Keys.CustomFontName)
+        preferences.remove(Keys.BackgroundImagePath)
+    }
+
+    private fun persistThemeAssets(
+        preferences: androidx.datastore.preferences.core.MutablePreferences,
+        theme: CustomReaderTheme
+    ) {
+        val fontPath = theme.customFontPath?.takeIf(String::isNotBlank)
+        if (theme.font == ReaderFont.CUSTOM && fontPath != null) {
+            val fontId = theme.customFontId ?: ReaderFontLibraryCodec.legacyId(fontPath)
+            val fonts = ReaderFontLibraryCodec.decode(preferences[Keys.FontLibrary])
+            if (fonts.none { it.id == fontId }) {
+                preferences[Keys.FontLibrary] = ReaderFontLibraryCodec.encode(
+                    fonts + ReaderFontAsset(
+                        id = fontId,
+                        displayName = theme.customFontName?.takeIf(String::isNotBlank) ?: "自定义字体",
+                        filePath = fontPath
+                    )
+                )
+            }
+        }
+        val backgroundPath = theme.backgroundImagePath?.takeIf(String::isNotBlank)
+        if (backgroundPath != null) {
+            val imageId = theme.backgroundImageId ?: ReaderImageLibraryCodec.legacyId(backgroundPath)
+            val images = ReaderImageLibraryCodec.decode(preferences[Keys.ImageLibrary])
+            if (images.none { it.id == imageId }) {
+                preferences[Keys.ImageLibrary] = ReaderImageLibraryCodec.encode(
+                    images + ReaderImageAsset(
+                        id = imageId,
+                        displayName = "主题背景",
+                        filePath = backgroundPath
+                    )
+                )
+            }
+        }
+    }
+    private fun persistLegacyReaderAssets(
+        preferences: androidx.datastore.preferences.core.MutablePreferences
+    ) {
+        val legacyFontPath = preferences[Keys.CustomFontPath]?.takeIf(String::isNotBlank)
+        if (legacyFontPath != null) {
+            val fonts = ReaderFontLibraryCodec.decode(preferences[Keys.FontLibrary])
+            val migrated = ReaderFontLibraryCodec.includeLegacy(
+                fonts,
+                legacyFontPath,
+                preferences[Keys.CustomFontName]
+            )
+            if (migrated != fonts) preferences[Keys.FontLibrary] = ReaderFontLibraryCodec.encode(migrated)
+        }
+        val legacyBackgroundPath = preferences[Keys.BackgroundImagePath]?.takeIf(String::isNotBlank)
+        if (legacyBackgroundPath != null) {
+            val images = ReaderImageLibraryCodec.decode(preferences[Keys.ImageLibrary])
+            val migrated = ReaderImageLibraryCodec.includeLegacyBackground(images, legacyBackgroundPath)
+            if (migrated != images) preferences[Keys.ImageLibrary] = ReaderImageLibraryCodec.encode(migrated)
+        }
+    }
+    suspend fun setWidePageLayout(value: WidePageLayout) {
+        dataStore.edit { it[Keys.WidePageLayout] = value.name }
+    }
+
+    suspend fun setCompanionSidePaneEnabled(value: Boolean) {
+        dataStore.edit { it[Keys.CompanionSidePaneEnabled] = value }
+    }
+
+    suspend fun setPageMode(value: PageMode) {
+        dataStore.edit { it[Keys.PageMode] = value.name }
+    }
+
+    suspend fun setAutoReadSettings(value: AutoReadSettings) {
+        val safe = value.normalized()
+        dataStore.edit {
+            it[Keys.PageMode] = safe.mode.name
+            it[Keys.AutoReadMode] = safe.mode.name
+            it[Keys.AutoReadSpeed] = safe.scrollDpPerSecond
+            it[Keys.AutoReadInterval] = safe.pageIntervalSeconds
+            it[Keys.AutoReadGuide] = safe.showGuide
+        }
+    }
+
+    suspend fun setPageTurnAnimation(value: PageTurnAnimation) {
+        dataStore.edit { it[Keys.PageTurnAnimation] = value.name }
+    }
+
+    suspend fun setModernBackTextOpacity(value: Float) {
+        dataStore.edit { it[Keys.ModernBackTextOpacity] = value.coerceIn(0f, 1f) }
+    }
+    suspend fun setModernCurlRadiusScale(value: Float) {
+        dataStore.edit { it[Keys.ModernCurlRadiusScale] = value.coerceIn(.6f, 1.8f) }
+    }
+
+    suspend fun setShelfLayout(value: ShelfLayout) {
+        dataStore.edit { it[Keys.ShelfLayout] = value.name }
+    }
+
+    suspend fun setShelfBookOrder(value: List<Long>, readAnchor: Long) {
+        dataStore.edit {
+            it[Keys.ShelfBookOrder] = value.distinct().joinToString(",")
+            it[Keys.ShelfBookOrderReadAnchor] = readAnchor
+        }
+    }
+
+    suspend fun setReadingOrderAffectsShelf(value: Boolean) {
+        dataStore.edit { it[Keys.ReadingOrderAffectsShelf] = value }
+    }
+
+    suspend fun setKeepScreenOn(value: Boolean) {
+        dataStore.edit { it[Keys.KeepScreenOn] = value }
+    }
+
+    suspend fun setImmersiveReading(value: Boolean) {
+        dataStore.edit { it[Keys.ImmersiveReading] = value }
+    }
+
+    suspend fun setVolumeKeysPageTurn(value: Boolean) {
+        dataStore.edit { it[Keys.VolumeKeysPageTurn] = value }
+    }
+
+    suspend fun setPhysicalKeyBindings(bindings: List<ReaderKeyBinding>) {
+        dataStore.edit { it[Keys.PhysicalKeyBindings] = ReaderKeyBindings.encode(bindings) }
+    }
+
+    /** [FOLLOW_SYSTEM_BRIGHTNESS] 或 0..1；越界值一律钳回区间，避免写进一个点不亮的窗口。 */
+    suspend fun setScreenBrightness(value: Float) {
+        val stored = if (value < 0f) FOLLOW_SYSTEM_BRIGHTNESS else value.coerceIn(0f, 1f)
+        dataStore.edit { it[Keys.ScreenBrightness] = stored }
+    }
+
+    suspend fun setBackgroundImagePath(path: String?, slot: ReaderThemeSlot = ReaderThemeSlot.DAY) {
+        dataStore.edit { preferences ->
+            if (path.isNullOrBlank()) {
+                preferences.remove(Keys.BackgroundImagePath)
+                preferences.remove(backgroundImageKey(slot))
+            } else {
+                val images = imageLibraryFrom(preferences)
+                val image = images.firstOrNull { it.filePath == path }
+                    ?: ReaderImageAsset(
+                        id = ReaderImageLibraryCodec.legacyId(path),
+                        displayName = "原有阅读背景",
+                        filePath = path
+                    ).also { legacy ->
+                        preferences[Keys.ImageLibrary] = ReaderImageLibraryCodec.encode(images + legacy)
+                    }
+                preferences[backgroundImageKey(slot)] = image.id
+                preferences.remove(Keys.BackgroundImagePath)
+            }
+        }
+    }
+
+    suspend fun addReaderImage(image: ReaderImageAsset, selectAsBackground: Boolean = false) {
+        dataStore.edit { preferences ->
+            val existing = imageLibraryFrom(preferences)
+            preferences[Keys.ImageLibrary] = ReaderImageLibraryCodec.encode(
+                existing.filterNot { it.id == image.id || it.filePath == image.filePath } + image
+            )
+            if (selectAsBackground) {
+                preferences[Keys.SelectedBackgroundImageId] = image.id
+                preferences.remove(Keys.BackgroundImagePath)
+            }
+        }
+    }
+
+    suspend fun selectBackgroundImage(id: String, slot: ReaderThemeSlot = ReaderThemeSlot.DAY) {
+        dataStore.edit { preferences ->
+            require(imageLibraryFrom(preferences).any { it.id == id }) { "图片不存在或已删除" }
+            preferences[backgroundImageKey(slot)] = id
+            preferences.remove(Keys.BackgroundImagePath)
+        }
+    }
+
+    suspend fun renameReaderImage(id: String, displayName: String) {
+        val name = displayName.trim().take(48)
+        require(name.isNotBlank()) { "图片名称不能为空" }
+        dataStore.edit { preferences ->
+            val images = imageLibraryFrom(preferences)
+            require(images.any { it.id == id }) { "图片不存在或已删除" }
+            // 裸路径背景在改名时会被收编进图片库，先把两槽当前选中项记下来再重写。
+            val active = ReaderThemeSlot.entries.associateWith { slot ->
+                activeBackgroundId(preferences, images, slot)
+            }
+            preferences[Keys.ImageLibrary] = ReaderImageLibraryCodec.encode(
+                images.map { if (it.id == id) it.copy(displayName = name) else it }
+            )
+            active.forEach { (slot, activeId) ->
+                if (activeId != null) preferences[backgroundImageKey(slot)] = activeId
+            }
+            preferences.remove(Keys.BackgroundImagePath)
+        }
+    }
+
+    suspend fun setReaderImagePurpose(id: String, purpose: ReaderImagePurpose) {
+        dataStore.edit { preferences ->
+            val images = imageLibraryFrom(preferences)
+            require(images.any { it.id == id }) { "图片不存在或已删除" }
+            preferences[Keys.ImageLibrary] = ReaderImageLibraryCodec.encode(
+                images.map { if (it.id == id) it.copy(purpose = purpose) else it }
+            )
+        }
+    }
+
+    suspend fun removeReaderImage(id: String) {
+        dataStore.edit { preferences ->
+            val images = imageLibraryFrom(preferences)
+            val active = ReaderThemeSlot.entries.associateWith { slot ->
+                activeBackgroundId(preferences, images, slot)
+            }
+            preferences[Keys.ImageLibrary] = ReaderImageLibraryCodec.encode(images.filterNot { it.id == id })
+            active.forEach { (slot, activeId) ->
+                when (activeId) {
+                    null -> Unit
+                    id -> preferences.remove(backgroundImageKey(slot))
+                    else -> preferences[backgroundImageKey(slot)] = activeId
+                }
+            }
+            preferences.remove(Keys.BackgroundImagePath)
+        }
+    }
+
+    suspend fun setBackgroundImageOpacity(
+        value: Float,
+        slot: ReaderThemeSlot = ReaderThemeSlot.DAY
+    ) {
+        dataStore.edit { it[backgroundOpacityKey(slot)] = value.coerceIn(0.05f, 1f) }
+    }
+
+    suspend fun setSyntaxHighlightEnabled(value: Boolean) {
+        dataStore.edit { it[Keys.SyntaxHighlightEnabled] = value }
+    }
+
+    suspend fun saveSyntaxHighlightRule(rule: ReaderSyntaxRule) {
+        dataStore.edit { preferences ->
+            val existing = ReaderSyntaxRuleCodec.decode(preferences[Keys.SyntaxHighlightRules])
+            val id = rule.id.takeIf { it != 0L } ?: ((existing.maxOfOrNull { it.id } ?: 0L) + 1)
+            preferences[Keys.SyntaxHighlightRules] = ReaderSyntaxRuleCodec.encode(
+                existing.filterNot { it.id == id } + rule.copy(id = id)
+            )
+        }
+    }
+
+    suspend fun deleteSyntaxHighlightRule(id: Long) {
+        dataStore.edit { preferences ->
+            val remaining = ReaderSyntaxRuleCodec.decode(preferences[Keys.SyntaxHighlightRules])
+                .filterNot { it.id == id }
+            preferences[Keys.SyntaxHighlightRules] = ReaderSyntaxRuleCodec.encode(remaining)
+        }
+    }
+
+    suspend fun setTapZones(zones: ReaderTapZones) {
+        require(zones.actions.size == 13 && zones.hasMenu)
+        dataStore.edit { it[Keys.TapZones] = zones.encode() }
+    }
+
+    suspend fun setEnglishLearning(enabled: Boolean) { dataStore.edit { it[Keys.EnglishLearning] = enabled } }
+    suspend fun setEnglishBionic(enabled: Boolean) { dataStore.edit { it[Keys.EnglishBionic] = enabled } }
+    suspend fun setBilingual(bookId: Long, visible: Boolean) { dataStore.edit { prefs ->
+        val books = prefs[Keys.BilingualBooks].orEmpty()
+        prefs[Keys.BilingualBooks] = if (visible) books + bookId.toString() else books - bookId.toString()
+    } }
+
+    suspend fun setWordAnnotationMode(mode: com.mozhi.reader.core.dictionary.WordAnnotationMode) { dataStore.edit { it[Keys.WordAnnotationMode] = mode.name } }
+    suspend fun saveVocabulary(word: com.mozhi.reader.core.dictionary.VocabularyWord, remove: Boolean = false) {
+        dataStore.edit { prefs ->
+            val words = com.mozhi.reader.core.dictionary.VocabularyCodec.decode(prefs[Keys.Vocabulary])
+            val key = com.mozhi.reader.core.dictionary.EnglishWords.normalize(word.word)
+            val next = words.filterNot { it.word == key } + if (remove) emptyList() else listOf(word.copy(word = key))
+            require(next.size <= 10_000) { "生词本已达到 10000 词，请先整理" }
+            prefs[Keys.Vocabulary] = com.mozhi.reader.core.dictionary.VocabularyCodec.encode(next)
+        }
+    }
+
+    suspend fun saveTextReplacementRule(rule: ReaderTextReplacementRule) {
+        dataStore.edit { preferences ->
+            val existing = ReaderTextReplacementRuleCodec.decode(preferences[Keys.TextReplacementRules])
+            val id = rule.id.takeIf { it != 0L } ?: ((existing.maxOfOrNull { it.id } ?: 0L) + 1L)
+            val saved = rule.copy(id = id)
+            val next = existing.toMutableList()
+            val index = next.indexOfFirst { it.id == id }
+            if (index >= 0) next[index] = saved else next += saved
+            preferences[Keys.TextReplacementRules] = ReaderTextReplacementRuleCodec.encode(next)
+        }
+    }
+
+    suspend fun deleteTextReplacementRule(id: Long) {
+        dataStore.edit { preferences ->
+            val existing = ReaderTextReplacementRuleCodec.decode(preferences[Keys.TextReplacementRules])
+            preferences[Keys.TextReplacementRules] = ReaderTextReplacementRuleCodec.encode(
+                existing.filterNot { it.id == id }
+            )
+        }
+    }
+
+    private fun fontLibraryFrom(preferences: Preferences): List<ReaderFontAsset> =
+        ReaderFontLibraryCodec.includeLegacy(
+            ReaderFontLibraryCodec.decode(preferences[Keys.FontLibrary]),
+            preferences[Keys.CustomFontPath],
+            preferences[Keys.CustomFontName]
+        )
+
+    private fun imageLibraryFrom(preferences: Preferences): List<ReaderImageAsset> =
+        ReaderImageLibraryCodec.includeLegacyBackground(
+            ReaderImageLibraryCodec.decode(preferences[Keys.ImageLibrary]),
+            preferences[Keys.BackgroundImagePath]
+        )
+
+    // 日间槽沿用原有键名，夜间槽另起四个键；这样老配置就是现成的日间方案，无需迁移。
+    private fun themeKey(slot: ReaderThemeSlot) =
+        if (slot == ReaderThemeSlot.DAY) Keys.Theme else Keys.NightTheme
+
+    private fun customThemeKey(slot: ReaderThemeSlot) =
+        if (slot == ReaderThemeSlot.DAY) Keys.ActiveCustomThemeId else Keys.NightActiveCustomThemeId
+
+    private fun backgroundImageKey(slot: ReaderThemeSlot) = if (slot == ReaderThemeSlot.DAY) {
+        Keys.SelectedBackgroundImageId
+    } else {
+        Keys.NightSelectedBackgroundImageId
+    }
+
+    private fun backgroundOpacityKey(slot: ReaderThemeSlot) = if (slot == ReaderThemeSlot.DAY) {
+        Keys.BackgroundImageOpacity
+    } else {
+        Keys.NightBackgroundImageOpacity
+    }
+
+    private fun activeBackgroundId(
+        preferences: Preferences,
+        images: List<ReaderImageAsset>,
+        slot: ReaderThemeSlot = ReaderThemeSlot.DAY
+    ): String? = preferences[backgroundImageKey(slot)]
+        ?.takeIf { id -> images.any { it.id == id } }
+        ?: preferences[Keys.BackgroundImagePath]
+            ?.takeIf { slot == ReaderThemeSlot.DAY }
+            ?.let { path -> images.firstOrNull { it.filePath == path }?.id }
+
+    /** 当前伴读角色（personas.id）；null = 未选择，界面按第一个角色处理。 */
+    val activePersonaId: Flow<Long?> = dataStore.data.map { it[Keys.ActivePersonaId] }
+
+    suspend fun setActivePersonaId(personaId: Long?) {
+        dataStore.edit { preferences ->
+            if (personaId == null) {
+                preferences.remove(Keys.ActivePersonaId)
+            } else {
+                preferences[Keys.ActivePersonaId] = personaId
+            }
+        }
+    }
+
+    /**
+     * 上次在段评讨论串里点名的角色；弹层打开时预选它，省去每次重新挑人。
+     * null = 还没点过名或上次主动取消了点名（只写想法、不叫人回复）。
+     */
+    val discussionPersonaId: Flow<Long?> = dataStore.data.map { it[Keys.DiscussionPersonaId] }
+
+    suspend fun setDiscussionPersonaId(personaId: Long?) {
+        dataStore.edit { preferences ->
+            if (personaId == null) {
+                preferences.remove(Keys.DiscussionPersonaId)
+            } else {
+                preferences[Keys.DiscussionPersonaId] = personaId
+            }
+        }
+    }
+
+    /** 伴读输入区的 AI 建议回复；默认开启，关闭后不再发起建议生成请求。 */
+    val suggestionRepliesEnabled: Flow<Boolean> =
+        dataStore.data.map { it[Keys.SuggestionReplies] ?: true }
+
+    suspend fun setSuggestionRepliesEnabled(value: Boolean) {
+        dataStore.edit { it[Keys.SuggestionReplies] = value }
+    }
+
+    /** 伴读默认只读取用户已读范围；关闭后可检索整本书。 */
+    val companionSpoilerProtectionEnabled: Flow<Boolean> =
+        dataStore.data.map { it[Keys.CompanionSpoilerProtection] ?: true }
+
+    suspend fun setCompanionSpoilerProtectionEnabled(value: Boolean) {
+        dataStore.edit { it[Keys.CompanionSpoilerProtection] = value }
+    }
+
+    /**
+     * 伴读记忆的范围开关（Memory 2.0 第 5 节）。长期记忆默认开，跨书能力默认关；
+     * 用户主动开启后才允许跨书召回。
+     */
+    val companionMemorySettings: Flow<CompanionMemorySettings> = dataStore.data.map { preferences ->
+        CompanionMemorySettings(
+            longTermEnabled = preferences[Keys.CompanionLongTermMemory] ?: true,
+            crossBookEnabled = preferences[Keys.CompanionCrossBookMemory] ?: false,
+            crossBookChatSearchEnabled = preferences[Keys.CompanionCrossBookChatSearch] ?: false
+        )
+    }
+
+    suspend fun setCompanionLongTermMemory(value: Boolean) {
+        dataStore.edit { it[Keys.CompanionLongTermMemory] = value }
+    }
+
+    suspend fun setCompanionCrossBookMemory(value: Boolean) {
+        dataStore.edit { it[Keys.CompanionCrossBookMemory] = value }
+    }
+
+    suspend fun setCompanionCrossBookChatSearch(value: Boolean) {
+        dataStore.edit { it[Keys.CompanionCrossBookChatSearch] = value }
+    }
+
+    /** 显示 AI 批注：关闭后角色划线与评论小点不再渲染，书籍详情仍可回顾。默认开。 */
+    val showAiAnnotations: Flow<Boolean> =
+        dataStore.data.map { it[Keys.ShowAiAnnotations] ?: true }
+
+    suspend fun setShowAiAnnotations(value: Boolean) {
+        dataStore.edit { it[Keys.ShowAiAnnotations] = value }
+    }
+
+    /** 即划即改：记住上次划线样式（AnnotationStyle wire 值），一击直接复用。 */
+    val lastAnnotationStyle: Flow<String> =
+        dataStore.data.map { it[Keys.LastAnnotationStyle] ?: "HIGHLIGHT" }
+
+    /** 上次划线颜色（AnnotationColors 色名）。 */
+    val lastAnnotationColor: Flow<String> =
+        dataStore.data.map { it[Keys.LastAnnotationColor] ?: "amber" }
+
+    suspend fun setLastAnnotationInk(style: String, colorTag: String) {
+        dataStore.edit {
+            it[Keys.LastAnnotationStyle] = style
+            it[Keys.LastAnnotationColor] = colorTag
+        }
+    }
+
+    /**
+     * 多气泡回复：AI 的输出按行拆成独立气泡，像真人分条发消息。默认关——
+     * 它会改变模型的输出风格（提示词要求短行），不该在用户不知情时生效。
+     */
+    val companionMultiBubbleEnabled: Flow<Boolean> =
+        dataStore.data.map { it[Keys.CompanionMultiBubble] ?: false }
+
+    val companionTokenUsageEnabled: Flow<Boolean> =
+        dataStore.data.map { it[Keys.CompanionTokenUsage] ?: false }
+
+    suspend fun setCompanionTokenUsageEnabled(value: Boolean) {
+        dataStore.edit { it[Keys.CompanionTokenUsage] = value }
+    }
+
+    /** Atomically edit the selected preset, including a book-specific or night preset. */
+    suspend fun updateBoundTypography(bookId: Long, slot: ReaderThemeSlot,
+        transform: (CustomReaderTheme) -> CustomReaderTheme): Boolean {
+        val fallback = settings.first().typographySnapshot()
+        var updated = false
+        dataStore.edit { preferences ->
+            val book = BookReaderThemeCodec.decode(preferences[Keys.BookThemes])[bookId]?.takeIf { it.enabled }
+            val id = if (book != null) book.customThemeIdFor(slot) else preferences[customThemeKey(slot)]
+            val themes = CustomReaderThemeCodec.decode(preferences[Keys.CustomThemes])
+            if (themes.any { it.id == id }) {
+                preferences[Keys.CustomThemes] = CustomReaderThemeCodec.encode(themes.map { if (it.id == id) transform(it) else it })
+            } else {
+                val themeName = book?.themeFor(slot)?.name ?: preferences[themeKey(slot)]
+                    ?: (if (slot == ReaderThemeSlot.NIGHT) ReaderTheme.DARK else ReaderTheme.SYSTEM).name
+                val profiles = ReaderThemeTypographyCodec.decode(preferences[Keys.BuiltinThemeTypography]).toMutableMap()
+                profiles[themeName] = transform(profiles[themeName] ?: fallback)
+                preferences[Keys.BuiltinThemeTypography] = ReaderThemeTypographyCodec.encode(profiles)
+            }
+            updated = true
+        }
+        return updated
+    }
+
+    suspend fun setCompanionMultiBubbleEnabled(value: Boolean) {
+        dataStore.edit { it[Keys.CompanionMultiBubble] = value }
+    }
+
+    /**
+     * agent 主动调用的总闸，见 [CompanionAutonomySettings]。全部默认关：
+     * 应用替用户花钱这件事必须他先点头。
+     */
+    val companionAutonomySettings: Flow<CompanionAutonomySettings> =
+        dataStore.data.map { preferences ->
+            CompanionAutonomySettings(
+                voiceRepliesEnabled = preferences[Keys.CompanionVoiceReplies] ?: false,
+                imageRepliesEnabled = preferences[Keys.CompanionImageReplies] ?: false,
+                proactiveAnnotationsEnabled =
+                    preferences[Keys.CompanionProactiveAnnotations] ?: false,
+                proactiveAnnotationVoiceEnabled =
+                    preferences[Keys.CompanionProactiveAnnotationVoice] ?: false,
+                proactiveAnnotationImageEnabled =
+                    preferences[Keys.CompanionProactiveAnnotationImage] ?: false,
+                annotationNotice = preferences[Keys.CompanionAnnotationNotice]
+                    ?.let { runCatching { ProactiveAnnotationNotice.valueOf(it) }.getOrNull() }
+                    ?: ProactiveAnnotationNotice.BUILT_IN,
+                annotationLimits = ProactiveAnnotationLimitsCodec.decodeGlobal(
+                    preferences[Keys.CompanionAnnotationLimits]
+                ),
+                annotationLimitsByBook = ProactiveAnnotationLimitsCodec.decodeBooks(
+                    preferences[Keys.CompanionAnnotationLimitsByBook]
+                ),
+                annotationPersonaIds = preferences[Keys.CompanionAnnotationPersonas].orEmpty()
+                    .mapNotNull { it.toLongOrNull()?.takeIf { id -> id > 0 } }.toSet(),
+                annotationPrompts = ProactiveAnnotationPrompts.decode(preferences[Keys.CompanionAnnotationPrompts])
+            )
+        }
+
+    suspend fun setCompanionVoiceReplies(value: Boolean) {
+        dataStore.edit { it[Keys.CompanionVoiceReplies] = value }
+    }
+
+    suspend fun setCompanionImageReplies(value: Boolean) {
+        dataStore.edit { it[Keys.CompanionImageReplies] = value }
+    }
+
+    suspend fun setCompanionProactiveAnnotations(value: Boolean) {
+        dataStore.edit { it[Keys.CompanionProactiveAnnotations] = value }
+    }
+
+    suspend fun setCompanionProactiveAnnotationVoice(value: Boolean) {
+        dataStore.edit { it[Keys.CompanionProactiveAnnotationVoice] = value }
+    }
+
+    suspend fun setCompanionProactiveAnnotationImage(value: Boolean) {
+        dataStore.edit { it[Keys.CompanionProactiveAnnotationImage] = value }
+    }
+
+    suspend fun setCompanionAnnotationNotice(value: ProactiveAnnotationNotice) {
+        dataStore.edit { it[Keys.CompanionAnnotationNotice] = value.name }
+    }
+
+    suspend fun setAnnotationPersonaIds(ids: Set<Long>) {
+        dataStore.edit { it[Keys.CompanionAnnotationPersonas] = ids.filter { id -> id > 0 }.map(Long::toString).toSet() }
+    }
+
+    suspend fun toggleAnnotationPersona(id: Long) {
+        if (id <= 0) return
+        dataStore.edit { preferences ->
+            val selected = preferences[Keys.CompanionAnnotationPersonas].orEmpty()
+            preferences[Keys.CompanionAnnotationPersonas] = if (id.toString() in selected) selected - id.toString() else selected + id.toString()
+        }
+    }
+
+    suspend fun saveAnnotationPrompt(preset: GlobalPromptPreset) {
+        val clean = preset.copy(id = preset.id.ifBlank { java.util.UUID.randomUUID().toString() },
+            name = preset.name.trim().take(80), prompt = preset.prompt.trim().take(GlobalPromptPresetStore.MAX_PROMPT_CHARS))
+        require(clean.name.isNotBlank() && clean.prompt.isNotBlank()) { "名称和提示词不能为空" }
+        editAnnotationPrompts { existing ->
+            if (existing.any { it.id == clean.id }) existing.map { if (it.id == clean.id) clean else it }
+            else existing + clean
+        }
+    }
+
+    suspend fun setAnnotationPromptEnabled(id: String, enabled: Boolean) = editAnnotationPrompts { presets ->
+        presets.map { if (it.id == id) it.copy(enabled = enabled) else it }
+    }
+
+    suspend fun deleteAnnotationPrompt(id: String) = editAnnotationPrompts { it.filterNot { preset -> preset.id == id } }
+
+    suspend fun resetAnnotationPrompts() = editAnnotationPrompts { ProactiveAnnotationPrompts.DEFAULTS }
+
+    private suspend fun editAnnotationPrompts(transform: (List<GlobalPromptPreset>) -> List<GlobalPromptPreset>) {
+        dataStore.edit { preferences ->
+            preferences[Keys.CompanionAnnotationPrompts] = ProactiveAnnotationPrompts.encode(
+                transform(ProactiveAnnotationPrompts.decode(preferences[Keys.CompanionAnnotationPrompts])))
+        }
+    }
+
+    suspend fun setCompanionAnnotationLimits(limits: ProactiveAnnotationLimits) {
+        dataStore.edit {
+            it[Keys.CompanionAnnotationLimits] = ProactiveAnnotationLimitsCodec.encodeGlobal(limits)
+        }
+    }
+
+    /** 传 null 表示这本书交还给全局默认。 */
+    suspend fun setCompanionAnnotationLimitsForBook(
+        bookId: Long,
+        override: BookProactiveAnnotationLimits?
+    ) {
+        if (bookId <= 0L) return
+        dataStore.edit { preferences ->
+            val current = ProactiveAnnotationLimitsCodec
+                .decodeBooks(preferences[Keys.CompanionAnnotationLimitsByBook])
+                .toMutableMap()
+            if (override == null) current -= bookId else current[bookId] = override
+            preferences[Keys.CompanionAnnotationLimitsByBook] =
+                ProactiveAnnotationLimitsCodec.encodeBooks(current)
+        }
+    }
+
+    /** Called only for explicit permanent deletion; retaining records retains their preferences. */
+    suspend fun removeBookOverrides(bookId: Long) {
+        dataStore.edit { preferences ->
+            preferences[Keys.BookThemes] = BookReaderThemeCodec.encode(
+                BookReaderThemeCodec.decode(preferences[Keys.BookThemes]).filterKeys { it != bookId })
+            preferences[Keys.BookChineseConversions] = BookChineseConversionCodec.encode(
+                BookChineseConversionCodec.decode(preferences[Keys.BookChineseConversions]).filterKeys { it != bookId })
+            preferences[Keys.CompanionAnnotationLimitsByBook] = ProactiveAnnotationLimitsCodec.encodeBooks(
+                ProactiveAnnotationLimitsCodec.decodeBooks(preferences[Keys.CompanionAnnotationLimitsByBook]).filterKeys { it != bookId })
+        }
+    }
+
+    private object Keys {
+        val CompanionAnnotationPersonas = stringSetPreferencesKey("companion_annotation_personas")
+        val CompanionAnnotationPrompts = stringPreferencesKey("companion_annotation_prompts")
+        val CompanionAnnotationLimits = stringPreferencesKey("companion_annotation_limits")
+        val CompanionAnnotationLimitsByBook =
+            stringPreferencesKey("companion_annotation_limits_by_book")
+        val FontScale = floatPreferencesKey("reader_font_scale")
+        val Font = stringPreferencesKey("reader_font")
+        val ReviewFont = stringPreferencesKey("review_quote_font")
+        val ReviewPreferences = stringPreferencesKey("reading_review_preferences")
+        val ReviewShareTemplates = stringPreferencesKey("review_share_templates")
+        val CustomFontPath = stringPreferencesKey("reader_custom_font_path")
+        val CustomFontName = stringPreferencesKey("reader_custom_font_name")
+        val FontLibrary = stringPreferencesKey("reader_font_library")
+        val SelectedCustomFontId = stringPreferencesKey("reader_selected_custom_font_id")
+        val FontWeight = intPreferencesKey("reader_font_weight")
+        val LineHeight = floatPreferencesKey("reader_line_height")
+        val PublisherStyleMode = stringPreferencesKey("reader_epub_publisher_style_mode")
+        val PageMargin = floatPreferencesKey("reader_page_margin")
+        val PageMarginLeft = floatPreferencesKey("reader_page_margin_left")
+        val PageMarginRight = floatPreferencesKey("reader_page_margin_right")
+        val PageMarginTop = floatPreferencesKey("reader_page_margin_top")
+        val PageMarginBottom = floatPreferencesKey("reader_page_margin_bottom")
+        val HeaderMarginTop = floatPreferencesKey("reader_header_margin_top")
+        val FooterMarginBottom = floatPreferencesKey("reader_footer_margin_bottom")
+        val LetterSpacingEm = floatPreferencesKey("reader_letter_spacing_em")
+        val ParagraphSpacingEm = floatPreferencesKey("reader_paragraph_spacing_em")
+        val FirstLineIndentEm = floatPreferencesKey("reader_first_line_indent_em")
+        val TitleScale = floatPreferencesKey("reader_title_scale")
+        val TitleTopSpacing = floatPreferencesKey("reader_title_top_spacing")
+        val TitleBottomSpacing = floatPreferencesKey("reader_title_bottom_spacing")
+        val TitleStyle = stringPreferencesKey("reader_title_style")
+        val TitleStylePresets = stringPreferencesKey("reader_title_style_presets")
+        val BuiltinThemeTypography = stringPreferencesKey("reader_builtin_theme_typography")
+        val TextJustification = booleanPreferencesKey("reader_text_justification")
+        val ShowHeader = booleanPreferencesKey("reader_show_header")
+        val ShowFooter = booleanPreferencesKey("reader_show_footer")
+        val Theme = stringPreferencesKey("reader_theme")
+        val WidePageLayout = stringPreferencesKey("reader_wide_page_layout")
+        val CompanionSidePaneEnabled = booleanPreferencesKey("reader_companion_side_pane")
+        val CompanionAnnotationNotice = stringPreferencesKey("companion_annotation_notice")
+        val PageMode = stringPreferencesKey("reader_page_mode")
+        val AutoReadMode = stringPreferencesKey("auto_read_mode")
+        val AutoReadSpeed = floatPreferencesKey("auto_read_speed")
+        val AutoReadInterval = intPreferencesKey("auto_read_interval")
+        val AutoReadGuide = booleanPreferencesKey("auto_read_guide")
+        val PageTurnAnimation = stringPreferencesKey("reader_page_turn_animation")
+        val ModernBackTextOpacity = floatPreferencesKey("reader_modern_back_text_opacity")
+        val ModernCurlRadiusScale = floatPreferencesKey("reader_modern_curl_radius_scale")
+        val ShelfLayout = stringPreferencesKey("shelf_layout")
+        val ShelfBookOrder = stringPreferencesKey("shelf_book_order")
+        val ShelfBookOrderReadAnchor = longPreferencesKey("shelf_book_order_read_anchor")
+        val ReadingOrderAffectsShelf = booleanPreferencesKey("reading_order_affects_shelf")
+        val KeepScreenOn = booleanPreferencesKey("keep_screen_on")
+        val ImmersiveReading = booleanPreferencesKey("reader_immersive_reading")
+        val VolumeKeysPageTurn = booleanPreferencesKey("reader_volume_keys_page_turn")
+        val PhysicalKeyBindings = stringPreferencesKey("reader_physical_key_bindings")
+        val ScreenBrightness = floatPreferencesKey("reader_screen_brightness")
+        val BackgroundImagePath = stringPreferencesKey("reader_background_image_path")
+        val ImageLibrary = stringPreferencesKey("reader_image_library")
+        val SelectedBackgroundImageId = stringPreferencesKey("reader_selected_background_image_id")
+        val BackgroundImageOpacity = floatPreferencesKey("reader_background_image_opacity")
+        val SyntaxHighlightEnabled = booleanPreferencesKey("reader_syntax_highlight_enabled")
+        val SyntaxHighlightRules = stringPreferencesKey("reader_syntax_highlight_rules")
+        val TextReplacementRules = stringPreferencesKey("reader_text_replacement_rules")
+        val TapZones = stringPreferencesKey("reader_tap_zones")
+        val EnglishLearning = booleanPreferencesKey("reader_english_learning")
+        val EnglishBionic = booleanPreferencesKey("reader_english_bionic")
+        val BilingualBooks = androidx.datastore.preferences.core.stringSetPreferencesKey("reader_bilingual_books")
+        val WordAnnotationMode = stringPreferencesKey("reader_word_annotation_mode")
+        val Vocabulary = stringPreferencesKey("reader_vocabulary")
+        val ThemeMode = stringPreferencesKey("app_theme_mode")
+        val AppFontId = stringPreferencesKey("app_font_id")
+        val AccentPreset = stringPreferencesKey("accent_preset")
+        val AccentCustomArgb = intPreferencesKey("accent_custom_argb")
+        val ColorScheme = stringPreferencesKey("color_scheme_preset")
+        val SemanticHarmony = stringPreferencesKey("semantic_harmony")
+        val SurfaceStyle = stringPreferencesKey("surface_style")
+        val NavStyle = stringPreferencesKey("nav_style")
+        val ShapeStyle = stringPreferencesKey("shape_style")
+        val ActivePersonaId = longPreferencesKey("active_persona_id")
+        val DiscussionPersonaId = longPreferencesKey("companion_discussion_persona_id")
+        val SuggestionReplies = booleanPreferencesKey("companion_suggestion_replies")
+        val CompanionTokenUsage = booleanPreferencesKey("companion_token_usage")
+        val CompanionSpoilerProtection = booleanPreferencesKey("companion_spoiler_protection")
+        val ShowAiAnnotations = booleanPreferencesKey("companion_show_ai_annotations")
+        val CompanionLongTermMemory = booleanPreferencesKey("companion_long_term_memory")
+        val CompanionCrossBookMemory = booleanPreferencesKey("companion_cross_book_memory")
+        val CompanionCrossBookChatSearch = booleanPreferencesKey("companion_cross_book_chat_search")
+        val LastAnnotationStyle = stringPreferencesKey("reader_annotation_last_style")
+        val LastAnnotationColor = stringPreferencesKey("reader_annotation_last_color")
+        val CompanionMultiBubble = booleanPreferencesKey("companion_multi_bubble")
+        val CompanionVoiceReplies = booleanPreferencesKey("companion_voice_replies")
+        val CompanionImageReplies = booleanPreferencesKey("companion_image_replies")
+        val CompanionProactiveAnnotations =
+            booleanPreferencesKey("companion_proactive_annotations")
+        val CompanionProactiveAnnotationVoice =
+            booleanPreferencesKey("companion_proactive_annotation_voice")
+        val CompanionProactiveAnnotationImage =
+            booleanPreferencesKey("companion_proactive_annotation_image")
+        val CustomThemes = stringPreferencesKey("reader_custom_themes")
+        val ActiveCustomThemeId = longPreferencesKey("reader_active_custom_theme_id")
+        val DayNightThemeAuto = booleanPreferencesKey("reader_theme_day_night_auto")
+        val NightTheme = stringPreferencesKey("reader_theme_night")
+        val NightActiveCustomThemeId = longPreferencesKey("reader_active_custom_theme_night_id")
+        val NightSelectedBackgroundImageId =
+            stringPreferencesKey("reader_selected_background_image_night_id")
+        val NightBackgroundImageOpacity =
+            floatPreferencesKey("reader_background_image_night_opacity")
+        val BookThemes = stringPreferencesKey("reader_book_themes")
+        val BookChineseConversions = stringPreferencesKey("reader_book_chinese_conversions")
+    }
+}

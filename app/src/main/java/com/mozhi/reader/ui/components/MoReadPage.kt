@@ -1,0 +1,310 @@
+package com.mozhi.reader.ui.components
+
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.exclude
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import com.mozhi.reader.ui.MoReadLayoutPolicy
+import com.mozhi.reader.ui.rememberMoReadWindowWidth
+import com.mozhi.reader.ui.theme.MoReadTokens
+import com.mozhi.reader.ui.theme.moReadMetrics
+import com.mozhi.reader.ui.theme.sectionDivider
+import com.mozhi.reader.ui.theme.sectionHairline
+
+/** Center a page without constraining its surrounding backdrop or navigation overlays. */
+@Composable
+fun MoReadBoundedContent(
+    modifier: Modifier = Modifier,
+    maxWidth: Dp = MoReadLayoutPolicy.FormMaxWidthDp.dp,
+    content: @Composable BoxScope.() -> Unit
+) {
+    Box(modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
+        Box(Modifier.widthIn(max = maxWidth).fillMaxSize(), content = content)
+    }
+}
+
+/**
+ * 全 App 唯一的页壳。
+ *
+ * 改造前：24 个二级页各写各的返回顶栏 —— 三种形态（M3 TopAppBar / 手搓 Row / 玻璃圆钮）、
+ * 四档横向 padding、两种标题字号。从一个页面退到另一个页面，返回箭头会跳位置，标题会变大小。
+ * 这是「不成熟」观感最直接的来源，也是唯一一处改一次就能全线受益的地方。
+ *
+ * 版式：顶部一条固定栏（返回 + 紧凑标题 + 动作），大标题作为列表首项
+ * 随内容滚走；滚过一定距离后紧凑标题淡入。两个标题不同时可见，所以顶栏永远只有一行信息。
+ */
+@Composable
+fun MoReadSecondaryPage(
+    title: String,
+    onBack: () -> Unit,
+    modifier: Modifier = Modifier,
+    subtitle: String? = null,
+    listState: LazyListState = rememberLazyListState(),
+    actions: @Composable RowScope.() -> Unit = {},
+    bottomBar: @Composable (() -> Unit)? = null,
+    applyTopInset: Boolean = true,
+    /** 列表项间距。逐条卡片的列表（如生词本）传 0，自己控制卡间距与分组留白。 */
+    itemSpacing: Dp = MoReadTokens.SectionGap,
+    /**
+     * 顶栏随内容滚走、不再固定。页面自带吸顶条（如生词本的常驻搜索框）时用：
+     * 否则下滑后「返回 + 紧凑标题」与吸顶条叠成两层固定栏。返回交给系统手势，回到顶部即可见。
+     */
+    scrollingTopBar: Boolean = false,
+    content: LazyListScope.() -> Unit
+) {
+    val collapsedAlpha by remember(listState) {
+        derivedStateOf {
+            collapsedTitleAlpha(listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset)
+        }
+    }
+
+    val settingsPane = com.mozhi.reader.ui.LocalSettingsPane.current
+    val inDialog = androidx.compose.ui.platform.LocalView.current.parent is androidx.compose.ui.window.DialogWindowProvider
+    val detailRoot = com.mozhi.reader.ui.LocalSettingsDetailRoot.current && !inDialog
+    MoReadBackdrop(modifier = modifier) {
+        Box(Modifier.fillMaxSize()) {
+            Column(
+                Modifier.align(Alignment.TopCenter)
+                    .widthIn(max = if (settingsPane) 920.dp else MoReadLayoutPolicy.FormMaxWidthDp.dp)
+                    .fillMaxSize()
+            ) {
+                if (!scrollingTopBar) {
+                    MoReadTopBar(
+                        title = title,
+                        titleAlpha = collapsedAlpha,
+                        onBack = onBack,
+                        actions = actions,
+                        applyTopInset = applyTopInset,
+                        showBack = !detailRoot
+                    )
+                } else if (applyTopInset) {
+                    // 只留状态栏高度的一截空白：列表内容被裁在它下面，不会从状态栏底下透出来。
+                    Box(Modifier.fillMaxWidth().safeTopPadding())
+                }
+                val gutter = if (settingsPane) 40.dp else MoReadTokens.PageGutter
+                Box(Modifier.fillMaxWidth().weight(1f)) {
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxSize().testTag("secondary-page-list"),
+                        contentPadding = PaddingValues(
+                            start = gutter,
+                            end = gutter,
+                            top = if (scrollingTopBar) 0.dp else 4.dp,
+                            bottom = if (bottomBar == null) 32.dp else 12.dp
+                        ),
+                        verticalArrangement = Arrangement.spacedBy(itemSpacing)
+                    ) {
+                        item(key = "page-hero", contentType = "hero") {
+                            if (scrollingTopBar) {
+                                Column {
+                                    // 与固定顶栏同一套版式，只是跟着大标题一起滚；横向撑出页边距，
+                                    // 让返回键停在与其他二级页相同的位置。
+                                    MoReadTopBar(
+                                        title = title,
+                                        titleAlpha = 0f,
+                                        onBack = onBack,
+                                        actions = actions,
+                                        applyTopInset = false,
+                                        showBack = !detailRoot,
+                                        modifier = Modifier.bleedHorizontally(gutter)
+                                    )
+                                    Box(Modifier.padding(top = 4.dp)) { PageHeroTitle(title = title, subtitle = subtitle) }
+                                }
+                            } else {
+                                PageHeroTitle(title = title, subtitle = subtitle)
+                            }
+                        }
+                        content()
+                    }
+                }
+                if (bottomBar != null) {
+                    bottomBar()
+                } else {
+                    // 键盘弹出时 navigationBars.exclude(ime) 归零，避免与调用点的 imePadding()
+                    // 叠出一条空隙（角色编辑页就是这么用的）。
+                    Box(
+                        Modifier.windowInsetsPadding(
+                            WindowInsets.navigationBars.exclude(WindowInsets.ime)
+                        )
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 四个主页的页壳。主页没有返回键，大标题常驻在内容里，右上角可放一个动作。
+ * [trailing] 是标题右侧的补充信息（「12 位角色」这类），不是按钮。
+ */
+@Composable
+fun MoReadRootPage(
+    title: String,
+    contentPadding: PaddingValues,
+    modifier: Modifier = Modifier,
+    trailing: String? = null,
+    listState: LazyListState = rememberLazyListState(),
+    content: LazyListScope.() -> Unit
+) {
+    val windowWidth = rememberMoReadWindowWidth()
+    Box(modifier = modifier.fillMaxSize().padding(contentPadding)) {
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.align(Alignment.TopCenter)
+                .widthIn(max = MoReadLayoutPolicy.FormMaxWidthDp.dp)
+                .fillMaxSize(),
+            contentPadding = PaddingValues(
+                start = MoReadTokens.PageGutter,
+                end = MoReadTokens.PageGutter,
+                top = 18.dp,
+                // 底部玻璃导航舱要压在内容上，留出它的高度否则最后一组永远被挡。
+                bottom = MoReadLayoutPolicy.rootBottomPaddingDp(windowWidth).dp
+            ),
+            verticalArrangement = Arrangement.spacedBy(MoReadTokens.SectionGap)
+        ) {
+            item(key = "root-hero", contentType = "hero") {
+                Row(verticalAlignment = Alignment.Bottom) {
+                    Text(text = title, style = MaterialTheme.typography.headlineLarge)
+                    if (!trailing.isNullOrBlank()) {
+                        Text(
+                            text = trailing,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(start = 10.dp, bottom = 6.dp)
+                        )
+                    }
+                }
+            }
+            content()
+        }
+    }
+}
+
+/** 顶栏在 [MoReadBackdrop] 内避让状态栏，背景持续延伸至窗口边缘。 */
+@Composable
+private fun MoReadTopBar(
+    title: String,
+    titleAlpha: Float,
+    onBack: () -> Unit,
+    actions: @Composable RowScope.() -> Unit,
+    applyTopInset: Boolean,
+    showBack: Boolean = true,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier.then(if (applyTopInset) Modifier.safeTopPadding() else Modifier)) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(moReadMetrics().topBarHeight)
+                .padding(horizontal = MoReadSpacingSmall),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (showBack) IconButton(onClick = onBack, modifier = Modifier.size(moReadMetrics().touchTarget)) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Outlined.ArrowBack,
+                    contentDescription = "返回"
+                )
+            }
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(start = 4.dp)
+                    .alpha(titleAlpha)
+            )
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                content = actions
+            )
+        }
+        // 紧凑标题露出后才画分隔线：页面停在顶部时顶栏与内容是连着的，不该有一道横杠。
+        if (titleAlpha > 0f) {
+            androidx.compose.material3.HorizontalDivider(
+                color = sectionDivider().copy(alpha = sectionDivider().alpha * titleAlpha)
+            )
+        }
+    }
+}
+
+/** 在列表的横向内边距里向两侧各撑出 [amount]，让列表项里的内容贴到页壳边缘。 */
+private fun Modifier.bleedHorizontally(amount: Dp): Modifier = layout { measurable, constraints ->
+    val extra = (amount * 2).roundToPx()
+    val width = constraints.maxWidth + extra
+    val placeable = measurable.measure(constraints.copy(minWidth = width, maxWidth = width))
+    layout(constraints.maxWidth, placeable.height) { placeable.place(-extra / 2, 0) }
+}
+
+/** 大标题：衬线，作为列表首项跟着内容一起滚。 */
+@Composable
+private fun PageHeroTitle(title: String, subtitle: String?) {
+    Column(modifier = Modifier.padding(top = 4.dp, bottom = 2.dp)) {
+        Text(text = title, style = MaterialTheme.typography.headlineMedium)
+        if (!subtitle.isNullOrBlank()) {
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 6.dp)
+            )
+        }
+    }
+}
+
+private val MoReadSpacingSmall = 8.dp
+// 顶栏高与触达区随形状密度变化，取值见 MoReadMetrics。
+
+/** 大标题滚出多少像素后紧凑标题完全显现。约等于大标题自身的高度。 */
+internal const val TITLE_COLLAPSE_DISTANCE_PX = 56
+
+/**
+ * 顶栏紧凑标题的不透明度。
+ *
+ * 纯函数：列表首项一旦滚出视口（index > 0）就固定为 1，否则按首项偏移线性淡入。
+ * 抽出来是为了能被单测钉死 —— 边界写错的表现是「标题在顶部就已经显形」或
+ * 「滚很远还没出来」，两者在真机上都要滚半天才发现。
+ */
+internal fun collapsedTitleAlpha(firstVisibleItemIndex: Int, firstVisibleItemScrollOffset: Int): Float {
+    if (firstVisibleItemIndex > 0) return 1f
+    if (firstVisibleItemScrollOffset <= 0) return 0f
+    return (firstVisibleItemScrollOffset.toFloat() / TITLE_COLLAPSE_DISTANCE_PX).coerceIn(0f, 1f)
+}
