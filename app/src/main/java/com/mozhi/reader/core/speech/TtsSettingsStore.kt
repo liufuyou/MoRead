@@ -91,10 +91,6 @@ data class TtsSettings(
                 aiBaseUrl.contains("minimax", ignoreCase = true)
             )
 
-    /**
-     * 恢复默认参数：只重置可调参数（语速、音量、音调、合成粒度与各类数量），
-     * 保留引擎、服务商、密钥、Base URL、模型与音色，避免用户配置被清空。
-     */
     fun withDefaultTuning(): TtsSettings {
         val defaults = TtsSettings()
         return copy(
